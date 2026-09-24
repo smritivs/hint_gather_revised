@@ -1,0 +1,877 @@
+// ===========================================================================
+// hint_gather_prefetcher.h.in
+//
+// ROLE
+//   Template for a *header-only* DPC4-ChampSim prefetcher module that models
+//   the memory-system behaviour of the HINT.GATHER instruction and of the
+//   Prefetch Hint Queue (PHQ).  CHIA's
+//     ChampSimNode.build_champsim(champsim_root, prefetcher_src,
+//                                 module_name, cache_level=...)
+//   writes the *rendered* form of this file to
+//     <champsim_root>/prefetcher/<module_name>/<module_name>.h
+//   and builds ChampSim with it.  Every method body below is therefore inline.
+//
+//   Rendering is done by champsim/render.py, which substitutes the literal
+//   @@<KEY>@@ tokens defined in docs/DESIGN.md sec 4.3 (and no others).
+//
+//   NOTE: the token form is written as @@<KEY>@@ here on purpose.  render.py
+//   validates by scanning this whole file for /@@\w+@@/, comments included, so
+//   spelling the generic form literally would make the file that documents the
+//   syntax fail validation for using an undefined placeholder.
+//
+//   Defined keys:
+//     HINT_SITES  HINT_DISTANCE  FANOUT  PHQ_ENTRIES
+//     DROPPABLE   MSHR_PRESSURE_THRESHOLD
+//     PREFETCH_LEVEL  VARIANT
+//
+//   Normative spec: ../docs/DESIGN.md  (sec 1 instruction, sec 2 PHQ, sec 3 genome,
+//   sec 4.3 ChampSim contract, sec 6 known limitations).
+//
+// ---------------------------------------------------------------------------
+// TARGETED API REVISION  (read this before debugging a build failure)
+// ---------------------------------------------------------------------------
+//   Primary target: ChampSim *master* after the 2024 module rewrite -- the
+//   revision used by DPC4.  Concretely we assume:
+//
+//     * modules are C++ classes deriving from `champsim::modules::prefetcher`
+//       (declared in "modules.h"), constructed from a `CACHE*`;
+//     * the hooks are non-virtual members named
+//         prefetcher_initialize()
+//         prefetcher_cache_operate(addr, ip, cache_hit, useful_prefetch,
+//                                  type, metadata_in) -> uint32_t
+//         prefetcher_cache_fill(addr, set, way, prefetch, evicted_addr,
+//                               metadata_in) -> uint32_t
+//         prefetcher_cycle_operate()
+//         prefetcher_final_stats()
+//       and that ChampSim *detects* which of them exist (so an unimplemented
+//       hook is simply never called);
+//     * addresses are `champsim::address` and the access kind is the scoped
+//       enum `access_type`;
+//     * the base class exposes `prefetch_line(addr, fill_this_level,
+//       metadata)` and the cache through the protected pointer `intern_`.
+//
+//   DEFENSIVE DESIGN.  Because the exact revision of the local ChampSim
+//   checkout is not known at render time, this file never hard-codes those
+//   types:
+//
+//     1. Every hook is a *member template* whose address / set / way / type
+//        parameters are deduced.  It therefore binds equally well to the old
+//        `uint64_t`-based signatures and to the new `champsim::address` ones,
+//        and it still satisfies ChampSim's `decltype`-based hook detection.
+//     2. All interaction with ChampSim (address<->uint64 conversion,
+//        prefetch_line, MSHR occupancy) goes through the SFINAE shims in
+//        namespace `hg_detail`, which fall back gracefully -- including to a
+//        "signal not available" path -- instead of failing to compile.
+//     3. If "modules.h" cannot be found at all, the file still compiles: the
+//        version-independent model (`hg::engine`) is defined and no hooks are
+//        attached.  That makes `g++ -fsyntax-only` a usable smoke test and
+//        keeps the repair agent's failure signal clean.
+//     4. No `override`, no virtuals, no out-of-line definitions, no globals
+//        with external linkage: safe to include exactly once from anywhere.
+//
+//   If your ChampSim predates the module rewrite and uses free
+//   `CACHE::prefetcher_*` members, define HG_CHAMPSIM_LEGACY_API before
+//   including this header to get the DPC3-style adaptor at the bottom.
+//
+// ---------------------------------------------------------------------------
+// WHAT THIS MODEL *CAN* CAPTURE
+// ---------------------------------------------------------------------------
+//   * Which demand loads are hint sites (keyed by PC from the LLVM pass) and
+//     how much memory-level parallelism the hint adds for them.
+//   * Cache-level placement of the hint's prefetches (L1D vs L2C).
+//   * A *finite* PHQ: occupancy, structural full-events, and the resulting
+//     hint drops -- i.e. the cost of making the queue too small.
+//   * Droppable-under-pressure behaviour against the MSHR occupancy signal.
+//   * Timeliness: prefetches that were still in flight when the demand
+//     arrived are counted as "late", not as wins.
+//   * Prefetch accuracy / usefulness at the modelled cache level.
+//
+// WHAT THIS MODEL *CANNOT* CAPTURE  (this honesty is part of the deliverable)
+// ---------------------------------------------------------------------------
+//   1. NO PIPELINE.  ChampSim is trace-driven: there is no issue queue, no
+//      LSQ, no rename, no ROB pressure here.  The entire *point* of
+//      HINT.GATHER -- that it consumes no IQ entry, no AGU port and no LSQ
+//      slot -- is therefore invisible to this model.  A hint is free here by
+//      construction, which is exactly why DESIGN.md sec 5.1 penalises hint
+//      density in the fitness function and re-anchors against gem5 O3.  Any
+//      pipeline claim in the write-up must come from gem5, never from here.
+//   2. NO DATA VALUES.  ChampSim traces carry addresses, not memory
+//      contents, so the model cannot load B[i+d] and cannot know the true
+//      target A[B[i+d]].  It *extrapolates* the recovered index stream (see
+//      `predict_target`), which is exact for affine/clustered index streams
+//      and deliberately imprecise for fully shuffled ones.  The resulting
+//      accuracy number is a model artefact: report coverage/accuracy from
+//      here only as a tuning signal, and quote gem5 for real speedup.
+//   3. NO OPERAND READINESS.  The value-vs-chase distinction of DESIGN.md
+//      sec 1.2 is a *dispatch-time* property.  Here it is approximated only as
+//      a difference in effective lookahead (see HG_EFFECTIVE_DISTANCE).
+//   4. NO TLB.  `tlb_miss_policy` is a gem5-only knob; page crossings are
+//      not modelled and no hint is dropped for translation reasons.
+//   5. NO SQUASHES.  There is no speculation in a trace-driven model, so
+//      `hintsDroppedSquash` has no counterpart here.
+//   6. The PHQ clock is the cache clock when `prefetcher_cycle_operate()` is
+//      available, and a *pseudo* clock derived from access count otherwise
+//      (see `HG_PSEUDO_CYCLES_PER_ACCESS`).
+// ===========================================================================
+
+#ifndef HINT_GATHER_PREFETCHER_H_
+#define HINT_GATHER_PREFETCHER_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <ostream>
+#include <type_traits>
+
+// ---------------------------------------------------------------------------
+// Optional ChampSim headers.  Everything below degrades gracefully if they
+// are absent, so that this file always compiles.
+// ---------------------------------------------------------------------------
+#if defined(__has_include)
+#if __has_include("cache.h")
+#include "cache.h"
+#elif __has_include(<champsim/cache.h>)
+#include <champsim/cache.h>
+#endif
+#if __has_include("modules.h")
+#include "modules.h"
+#define HG_HAS_CHAMPSIM_MODULES 1
+#elif __has_include(<champsim/modules.h>)
+#include <champsim/modules.h>
+#define HG_HAS_CHAMPSIM_MODULES 1
+#endif
+#endif  // __has_include
+
+#ifndef HG_HAS_CHAMPSIM_MODULES
+#define HG_HAS_CHAMPSIM_MODULES 0
+#endif
+
+// ===========================================================================
+// 1. Genome-derived compile-time configuration (rendered by render.py)
+// ===========================================================================
+
+// Symbolic values so that the raw genome strings ("L1D"/"L2C", "value"/
+// "chase") can be pasted in verbatim and still be type-checked by the
+// compiler: an unknown value becomes an undefined identifier, i.e. a loud
+// compile error rather than a silent mis-render.
+#define HG_LEVEL_L1D 0
+#define HG_LEVEL_L2C 1
+#define HG_VARIANT_value 0
+#define HG_VARIANT_chase 1
+
+namespace hg {
+
+// --- from the genome (docs/DESIGN.md sec 3) -----------------------------------
+static constexpr int HG_HINT_DISTANCE = @@HINT_DISTANCE@@;  // elements ahead
+static constexpr int HG_FANOUT = @@FANOUT@@;                // prefetches/hint
+static constexpr int HG_PHQ_ENTRIES = @@PHQ_ENTRIES@@;      // PHQ depth
+static constexpr bool HG_DROPPABLE = @@DROPPABLE@@;         // drop on pressure
+static constexpr double HG_MSHR_PRESSURE_THRESHOLD =
+    @@MSHR_PRESSURE_THRESHOLD@@;
+static constexpr int HG_PREFETCH_LEVEL = HG_LEVEL_@@PREFETCH_LEVEL@@;
+static constexpr int HG_VARIANT = HG_VARIANT_@@VARIANT@@;
+
+// --- model-only constants (not part of the genome) -------------------------
+
+// How many demand addresses we remember per site in order to recover the
+// index stream.  8 is enough for a stable dominant-delta vote and costs
+// 8 * 16 B per site.
+static constexpr unsigned HG_HISTORY = 8;
+
+// Effective lookahead, in elements, honouring @@VARIANT@@.
+//
+//   chase (HINT.GATHER.C): rs2 is &B[i+d], which is affine and ready at
+//       dispatch, so the PHQ performs the whole chase itself and the full
+//       genome distance is realised.
+//   value (HINT.GATHER):   rs2 is the *loaded* value B[i+d]; the hint cannot
+//       fire until the core's own load of B[i+d] has returned, so part of
+//       the nominal distance is consumed waiting for the operand.  We model
+//       that loss as halving the realised distance.  This is a modelling
+//       choice, not a measurement: it is the only aspect of sec 1.2 that a
+//       trace-driven simulator can express at all, and the real cost
+//       (PHQ poll timeouts, scoreboard pressure) is measured in gem5.
+static constexpr int HG_EFFECTIVE_DISTANCE =
+    (HG_VARIANT == HG_VARIANT_chase)
+        ? HG_HINT_DISTANCE
+        : ((HG_HINT_DISTANCE > 1) ? (HG_HINT_DISTANCE / 2) : 1);
+
+// `fill_this_level` for the issued prefetches.  Assumes the module is
+// installed in the L1D (CHIA's default cache_level); when the genome asks for
+// L2C we let the fill land in the next level instead.  If CHIA installs this
+// module at the L2C, build with -DHG_FORCE_FILL_THIS_LEVEL=1.
+#if defined(HG_FORCE_FILL_THIS_LEVEL) && HG_FORCE_FILL_THIS_LEVEL
+static constexpr bool HG_FILL_THIS_LEVEL = true;
+#else
+static constexpr bool HG_FILL_THIS_LEVEL = (HG_PREFETCH_LEVEL == HG_LEVEL_L1D);
+#endif
+
+// Cycles a PHQ entry stays busy: address generation + request hand-off.
+#ifndef HG_PHQ_SERVICE_CYCLES
+#define HG_PHQ_SERVICE_CYCLES 4
+#endif
+
+// Pseudo-clock used when prefetcher_cycle_operate() is not called by the
+// local ChampSim.  Documented approximation, see file header note (6).
+#ifndef HG_PSEUDO_CYCLES_PER_ACCESS
+#define HG_PSEUDO_CYCLES_PER_ACCESS 4
+#endif
+
+// Fallback MSHR capacity used ONLY when no occupancy signal is exposed by the
+// local API.  See `hg_detail::mshr_ratio`: in that case pressure is
+// approximated by (in-flight prefetches / HG_MSHR_PROXY_CAPACITY).
+#ifndef HG_MSHR_PROXY_CAPACITY
+#define HG_MSHR_PROXY_CAPACITY 16
+#endif
+
+// Cache block size used for prefetch bookkeeping (ChampSim is 64 B).
+#ifndef HG_LOG2_BLOCK_SIZE
+#define HG_LOG2_BLOCK_SIZE 6
+#endif
+
+// Direct-mapped table tracking outstanding/recent prefetches (for late and
+// useful accounting).  1024 entries * 24 B ~= 24 KB of *model* state; it is
+// bookkeeping, not a hardware proposal.
+#ifndef HG_PF_TABLE_BITS
+#define HG_PF_TABLE_BITS 10
+#endif
+static constexpr unsigned HG_PF_TABLE_SIZE = 1u << (HG_PF_TABLE_BITS);
+
+// ChampSim access_type / legacy type encoding: 0 == LOAD.  We only react to
+// demand loads; RFO/WRITE/PREFETCH/TRANSLATION are ignored.
+static constexpr int HG_TYPE_LOAD = 0;
+
+// ===========================================================================
+// 2. Hint-site table  (docs/DESIGN.md sec 4.3: {pc, base_reg_hint, elem_size,
+//    stride_bytes}).  render.py emits one comma-terminated initializer per
+//    site; the {0,0,0,0} sentinel keeps the array non-empty when the genome
+//    produced no sites at all.
+// ===========================================================================
+struct site_desc {
+  uint64_t pc;           // PC of the *demand* (gathered) load
+  uint64_t base_hint;    // base address of A, 0 if unknown at render time
+  uint32_t elem_size;    // bytes per element of A (1<<SHIFT)
+  int64_t stride_bytes;  // byte stride of the index stream B
+};
+
+static constexpr site_desc kSiteTable[] = {
+@@HINT_SITES@@  {0u, 0u, 0u, 0}  // sentinel -- pc == 0 terminates the table
+};
+static constexpr std::size_t kSiteTableSize =
+    sizeof(kSiteTable) / sizeof(kSiteTable[0]);
+
+}  // namespace hg
+
+// ===========================================================================
+// 3. SFINAE shims that isolate every ChampSim-version dependency
+// ===========================================================================
+namespace hg_detail {
+
+// Overload-priority tag: prio<N> prefers the highest viable overload.
+template <int N>
+struct prio : prio<N - 1> {};
+template <>
+struct prio<0> {};
+
+// --- address-like -> uint64_t ---------------------------------------------
+template <typename T>
+inline auto to_u64_impl(const T& a, prio<3>) -> decltype(a.template to<uint64_t>()) {
+  return a.template to<uint64_t>();  // champsim::address (post-2024)
+}
+template <typename T>
+inline auto to_u64_impl(const T& a, prio<2>)
+    -> decltype(static_cast<uint64_t>(a.to_underlying())) {
+  return static_cast<uint64_t>(a.to_underlying());
+}
+template <typename T>
+inline typename std::enable_if<std::is_integral<T>::value, uint64_t>::type
+to_u64_impl(const T& a, prio<1>) {
+  return static_cast<uint64_t>(a);  // legacy uint64_t addresses
+}
+template <typename T>
+inline uint64_t to_u64(const T& a) {
+  return to_u64_impl(a, prio<3>{});
+}
+
+// --- uint64_t -> address-like ---------------------------------------------
+template <typename T>
+inline auto from_u64_impl(uint64_t v, prio<3>) -> decltype(T{v}) {
+  return T{v};
+}
+template <typename T>
+inline auto from_u64_impl(uint64_t v, prio<2>)
+    -> decltype(T{typename T::underlying_type{v}}) {
+  return T{typename T::underlying_type{v}};
+}
+template <typename T>
+inline T from_u64_impl(uint64_t v, prio<1>) {
+  return static_cast<T>(v);
+}
+template <typename T>
+inline T from_u64(uint64_t v) {
+  return from_u64_impl<T>(v, prio<3>{});
+}
+
+// --- access_type (scoped enum) or legacy integral -> int -------------------
+template <typename T>
+inline typename std::enable_if<std::is_enum<T>::value, int>::type to_int(T v) {
+  return static_cast<int>(v);
+}
+template <typename T>
+inline typename std::enable_if<std::is_integral<T>::value, int>::type to_int(
+    T v) {
+  return static_cast<int>(v);
+}
+
+// --- prefetch_line ---------------------------------------------------------
+// Modern: prefetch_line(addr, fill_this_level, metadata)
+// DPC3  : prefetch_line(ip, base_addr, pf_addr, fill_this_level, metadata)
+template <typename Self, typename AddrT>
+inline auto issue_impl(Self* self, AddrT addr, bool fill, uint32_t md, prio<3>)
+    -> decltype(void(self->prefetch_line(addr, fill, md)), bool{}) {
+  return static_cast<bool>(self->prefetch_line(addr, fill, md));
+}
+template <typename Self, typename AddrT>
+inline auto issue_impl(Self* self, AddrT addr, bool fill, uint32_t md, prio<2>)
+    -> decltype(void(self->prefetch_line(addr, addr, addr, fill, md)), bool{}) {
+  return static_cast<bool>(self->prefetch_line(addr, addr, addr, fill, md));
+}
+template <typename Self, typename AddrT>
+inline bool issue_impl(Self*, AddrT, bool, uint32_t, prio<1>) {
+  return false;  // no injection API: model still counts, nothing is issued
+}
+template <typename Self, typename AddrT>
+inline bool issue_prefetch(Self* self, AddrT addr, bool fill, uint32_t md) {
+  return issue_impl(self, addr, fill, md, prio<3>{});
+}
+
+// --- MSHR occupancy ratio, or -1.0 when the API exposes no such signal ------
+template <typename C>
+inline auto mshr_ratio_impl(C* c, prio<4>)
+    -> decltype(static_cast<double>(c->get_mshr_occupancy_ratio())) {
+  return static_cast<double>(c->get_mshr_occupancy_ratio());
+}
+template <typename C>
+inline auto mshr_ratio_impl(C* c, prio<3>)
+    -> decltype(static_cast<double>(c->get_mshr_occupancy()) /
+                static_cast<double>(c->get_mshr_size())) {
+  const double cap = static_cast<double>(c->get_mshr_size());
+  return (cap > 0.0) ? static_cast<double>(c->get_mshr_occupancy()) / cap : 0.0;
+}
+template <typename C>
+inline auto mshr_ratio_impl(C* c, prio<2>)
+    -> decltype(static_cast<double>(c->get_occupancy(0u, 0ull)) /
+                static_cast<double>(c->get_size(0u, 0ull))) {
+  const double cap = static_cast<double>(c->get_size(0u, 0ull));
+  return (cap > 0.0) ? static_cast<double>(c->get_occupancy(0u, 0ull)) / cap
+                     : 0.0;
+}
+template <typename C>
+inline double mshr_ratio_impl(C*, prio<1>) {
+  return -1.0;  // caller falls back to the in-flight-prefetch approximation
+}
+template <typename C>
+inline double mshr_ratio(C* c) {
+  return (c == nullptr) ? -1.0 : mshr_ratio_impl(c, prio<4>{});
+}
+inline double mshr_ratio(std::nullptr_t) { return -1.0; }
+
+// NOTE: there is deliberately no non-member accessor for the module's
+// `intern_` (CACHE*) pointer or for `prefetch_line()`.  Both are *protected*
+// members of `champsim::modules::prefetcher`, so a free function may not touch
+// them; the corresponding shims live inside the adaptor class in sec 5A below.
+// The shims above are safe because they only use public API (or plain
+// integers), which is why the legacy sec 5B adaptor can call them directly.
+
+}  // namespace hg_detail
+
+// ===========================================================================
+// 4. The version-independent model: hint sites + PHQ + prefetch bookkeeping.
+//    Everything here speaks plain uint64_t, so it is testable without
+//    ChampSim and shared by every adaptor below.
+// ===========================================================================
+namespace hg {
+
+class engine {
+ public:
+  // ---- lifecycle ----------------------------------------------------------
+  inline void initialize() {
+    *this = engine();  // all members are trivially re-initialisable
+    for (std::size_t i = 0; i < kSiteTableSize; ++i) {
+      if (kSiteTable[i].pc != 0u) ++active_sites_;
+    }
+  }
+
+  inline void on_cycle() {
+    cycle_operate_seen_ = true;
+    ++cycle_;
+  }
+
+  // ---- demand access ------------------------------------------------------
+  // `issue(pf_addr_u64, fill_this_level) -> bool` injects one prefetch.
+  template <typename IssueFn>
+  inline void on_access(uint64_t ip, uint64_t addr, bool cache_hit,
+                        int type_code, double mshr_ratio_in, IssueFn&& issue) {
+    ++accesses_;
+
+    // Timeliness accounting for *any* demand touching a block we prefetched.
+    observe_demand(addr, cache_hit);
+
+    if (type_code != HG_TYPE_LOAD) return;
+
+    site_state* s = find_site(ip);
+    if (s == nullptr) return;
+
+    ++hints_seen_;
+    ++s->accesses;
+
+    // --- PHQ admission (DESIGN.md sec 2 step 1/4) ------------------------------
+    const uint64_t now = clock_now();
+    if (!phq_allocate(now)) {
+      ++phq_full_events_;
+      prefetches_dropped_ += static_cast<uint64_t>(HG_FANOUT);
+      hints_dropped_full_ += 1;
+      record_history(s, addr);
+      return;
+    }
+
+    // --- droppable under MSHR pressure (DESIGN.md sec 2 step 4) ---------------
+    const double pressure = (mshr_ratio_in >= 0.0)
+                                ? mshr_ratio_in
+                                : inflight_pressure_proxy();
+    if (mshr_ratio_in < 0.0) ++mshr_signal_missing_;
+    if (HG_DROPPABLE && pressure >= HG_MSHR_PRESSURE_THRESHOLD) {
+      ++hints_dropped_mshr_;
+      prefetches_dropped_ += static_cast<uint64_t>(HG_FANOUT);
+      record_history(s, addr);
+      return;
+    }
+
+    // --- address generation -------------------------------------------------
+    uint64_t target = 0;
+    if (!predict_target(*s, addr, &target)) {
+      ++hints_no_prediction_;
+      prefetches_dropped_ += static_cast<uint64_t>(HG_FANOUT);
+      record_history(s, addr);
+      return;
+    }
+
+    const uint64_t elem = (s->desc->elem_size != 0u) ? s->desc->elem_size : 8u;
+    for (int f = 0; f < HG_FANOUT; ++f) {
+      const uint64_t pf = target + static_cast<uint64_t>(f) * elem;
+      if (issue(pf, HG_FILL_THIS_LEVEL)) {
+        ++prefetches_issued_;
+        ++s->issued;
+        track_prefetch(pf, now);
+      } else {
+        ++prefetches_rejected_;
+      }
+    }
+    record_history(s, addr);
+  }
+
+  // ---- fill ---------------------------------------------------------------
+  inline void on_fill(uint64_t addr, bool was_prefetch) {
+    if (was_prefetch) ++prefetch_fills_;
+    pf_entry* e = pf_lookup(addr);
+    if (e != nullptr && !e->filled) {
+      e->filled = true;
+      if (inflight_ > 0) --inflight_;
+    }
+  }
+
+  // ---- stats --------------------------------------------------------------
+  inline void print_stats(std::ostream& os) const {
+    const uint64_t useful = useful_prefetches_;
+    const double accuracy =
+        (prefetches_issued_ > 0)
+            ? static_cast<double>(useful) /
+                  static_cast<double>(prefetches_issued_)
+            : 0.0;
+    const double drop_rate =
+        (hints_seen_ > 0)
+            ? static_cast<double>(hints_dropped_full_ + hints_dropped_mshr_ +
+                                  hints_no_prediction_) /
+                  static_cast<double>(hints_seen_)
+            : 0.0;
+
+    os << "\n*** HINT.GATHER prefetcher model (docs/DESIGN.md sec 4.3) ***\n";
+    // --- the five keys required by DESIGN.md sec 4.3 --------------------------
+    os << "hg_hints_seen: " << hints_seen_ << "\n";
+    os << "hg_prefetches_issued: " << prefetches_issued_ << "\n";
+    os << "hg_prefetches_dropped: " << prefetches_dropped_ << "\n";
+    os << "hg_phq_full_events: " << phq_full_events_ << "\n";
+    os << "hg_late_prefetches: " << late_prefetches_ << "\n";
+    // --- additional, all in the same `key: value` form ---------------------
+    os << "hg_useful_prefetches: " << useful << "\n";
+    os << "hg_prefetch_accuracy: " << accuracy << "\n";
+    os << "hg_prefetch_fills: " << prefetch_fills_ << "\n";
+    os << "hg_prefetches_rejected: " << prefetches_rejected_ << "\n";
+    os << "hg_hints_dropped_full: " << hints_dropped_full_ << "\n";
+    os << "hg_hints_dropped_mshr: " << hints_dropped_mshr_ << "\n";
+    os << "hg_hints_no_prediction: " << hints_no_prediction_ << "\n";
+    os << "hg_hint_drop_rate: " << drop_rate << "\n";
+    os << "hg_phq_occupancy_avg: " << phq_occupancy_avg() << "\n";
+    os << "hg_phq_entries: " << HG_PHQ_ENTRIES << "\n";
+    os << "hg_hint_sites: " << active_sites_ << "\n";
+    os << "hg_hint_distance: " << HG_HINT_DISTANCE << "\n";
+    os << "hg_effective_distance: " << HG_EFFECTIVE_DISTANCE << "\n";
+    os << "hg_fanout: " << HG_FANOUT << "\n";
+    os << "hg_variant: " << (HG_VARIANT == HG_VARIANT_chase ? "chase" : "value")
+       << "\n";
+    os << "hg_prefetch_level: "
+       << (HG_PREFETCH_LEVEL == HG_LEVEL_L1D ? "L1D" : "L2C") << "\n";
+    os << "hg_droppable: " << (HG_DROPPABLE ? 1 : 0) << "\n";
+    os << "hg_mshr_pressure_threshold: " << HG_MSHR_PRESSURE_THRESHOLD << "\n";
+    os << "hg_mshr_signal_missing: " << mshr_signal_missing_ << "\n";
+    os << "hg_demand_accesses: " << accesses_ << "\n";
+    os << "hg_model_cycles: " << clock_now() << "\n";
+    os << "hg_cycle_hook_available: " << (cycle_operate_seen_ ? 1 : 0) << "\n";
+    for (std::size_t i = 0; i < kSiteTableSize; ++i) {
+      if (kSiteTable[i].pc == 0u) continue;
+      os << "hg_site" << i << "_pc: 0x" << std::hex << kSiteTable[i].pc
+         << std::dec << "\n";
+      os << "hg_site" << i << "_accesses: " << sites_[i].accesses << "\n";
+      os << "hg_site" << i << "_issued: " << sites_[i].issued << "\n";
+    }
+  }
+
+ private:
+  // ---- per-site state -----------------------------------------------------
+  struct site_state {
+    const site_desc* desc = nullptr;
+    uint64_t hist[HG_HISTORY] = {};   // recent demand addresses at this site
+    int64_t deltas[HG_HISTORY] = {};  // recovered index-stream deltas (bytes)
+    unsigned hist_n = 0;
+    unsigned delta_n = 0;
+    bool have_last = false;
+    uint64_t last_addr = 0;
+    uint64_t min_addr = ~uint64_t(0);
+    uint64_t max_addr = 0;
+    uint64_t accesses = 0;
+    uint64_t issued = 0;
+  };
+
+  struct pf_entry {
+    uint64_t block = 0;
+    uint64_t issued_at = 0;
+    bool valid = false;
+    bool filled = false;
+    bool demanded = false;
+  };
+
+  // ---- helpers ------------------------------------------------------------
+  static inline uint64_t block_of(uint64_t addr) {
+    return addr >> (HG_LOG2_BLOCK_SIZE);
+  }
+
+  inline uint64_t clock_now() const {
+    return cycle_operate_seen_
+               ? cycle_
+               : accesses_ * static_cast<uint64_t>(HG_PSEUDO_CYCLES_PER_ACCESS);
+  }
+
+  inline site_state* find_site(uint64_t ip) {
+    // Linear scan: the compiler emits at most `max_hints_per_loop` sites per
+    // loop and a handful per benchmark, so this is cheaper than a map.
+    for (std::size_t i = 0; i < kSiteTableSize; ++i) {
+      if (kSiteTable[i].pc == 0u) continue;
+      if (kSiteTable[i].pc != ip) continue;
+      if (sites_[i].desc == nullptr) sites_[i].desc = &kSiteTable[i];
+      return &sites_[i];
+    }
+    return nullptr;
+  }
+
+  inline void record_history(site_state* s, uint64_t addr) {
+    if (s->have_last) {
+      const int64_t d = static_cast<int64_t>(addr) -
+                        static_cast<int64_t>(s->last_addr);
+      s->deltas[s->delta_n % HG_HISTORY] = d;
+      ++s->delta_n;
+    }
+    s->hist[s->hist_n % HG_HISTORY] = addr;
+    ++s->hist_n;
+    s->last_addr = addr;
+    s->have_last = true;
+    if (addr < s->min_addr) s->min_addr = addr;
+    if (addr > s->max_addr) s->max_addr = addr;
+  }
+
+  // Dominant (most frequent, ties -> most recent) delta of the recovered
+  // index stream.  Exact for affine and for clustered streams; for a fully
+  // shuffled gather it degenerates to "most recent delta", which is the
+  // honest limit of a value-less trace model (see file header, CANNOT #2).
+  static inline int64_t dominant_delta(const int64_t* d, unsigned n) {
+    if (n == 0) return 0;
+    int64_t best = d[n - 1];
+    unsigned best_count = 0;
+    for (unsigned i = 0; i < n; ++i) {
+      unsigned count = 0;
+      for (unsigned j = 0; j < n; ++j) {
+        if (d[j] == d[i]) ++count;
+      }
+      if (count > best_count) {
+        best_count = count;
+        best = d[i];
+      }
+    }
+    return best;
+  }
+
+  // Extrapolate HG_EFFECTIVE_DISTANCE elements ahead from the recovered
+  // stream, then wrap the result into the footprint observed for this site so
+  // that the modelled address always lands inside A (the real hint cannot
+  // escape the array either).
+  inline bool predict_target(const site_state& s, uint64_t addr,
+                             uint64_t* out) const {
+    const unsigned n = (s.delta_n < HG_HISTORY) ? s.delta_n : HG_HISTORY;
+    if (n == 0) return false;  // not enough history yet: nothing to predict
+
+    const int64_t delta = dominant_delta(s.deltas, n);
+    if (delta == 0) return false;
+
+    const int64_t step =
+        delta * static_cast<int64_t>(HG_EFFECTIVE_DISTANCE);
+    uint64_t target = static_cast<uint64_t>(static_cast<int64_t>(addr) + step);
+
+    const uint64_t lo = (s.desc->base_hint != 0u) ? s.desc->base_hint
+                                                  : s.min_addr;
+    const uint64_t hi = s.max_addr;
+    if (hi > lo) {
+      const uint64_t span = hi - lo;
+      if (target < lo || target > hi) {
+        target = lo + ((target - lo) % (span + 1u));
+      }
+    }
+    *out = target;
+    return true;
+  }
+
+  // ---- PHQ ----------------------------------------------------------------
+  inline bool phq_allocate(uint64_t now) {
+    unsigned busy = 0;
+    int slot = -1;
+    for (int i = 0; i < HG_PHQ_ENTRIES; ++i) {
+      if (phq_free_at_[i] > now) {
+        ++busy;
+      } else if (slot < 0) {
+        slot = i;
+      }
+    }
+    phq_occ_sum_ += busy;
+    ++phq_occ_samples_;
+    if (slot < 0) return false;
+    phq_free_at_[slot] = now + static_cast<uint64_t>(HG_PHQ_SERVICE_CYCLES);
+    return true;
+  }
+
+  inline double phq_occupancy_avg() const {
+    return (phq_occ_samples_ > 0) ? static_cast<double>(phq_occ_sum_) /
+                                        static_cast<double>(phq_occ_samples_)
+                                  : 0.0;
+  }
+
+  // ---- prefetch bookkeeping ----------------------------------------------
+  inline pf_entry* pf_lookup(uint64_t addr) {
+    const uint64_t blk = block_of(addr);
+    pf_entry& e = pf_table_[blk & (HG_PF_TABLE_SIZE - 1u)];
+    return (e.valid && e.block == blk) ? &e : nullptr;
+  }
+
+  inline void track_prefetch(uint64_t addr, uint64_t now) {
+    const uint64_t blk = block_of(addr);
+    pf_entry& e = pf_table_[blk & (HG_PF_TABLE_SIZE - 1u)];
+    if (e.valid && !e.filled && inflight_ > 0) --inflight_;  // evicted in-flight
+    e.block = blk;
+    e.issued_at = now;
+    e.valid = true;
+    e.filled = false;
+    e.demanded = false;
+    ++inflight_;
+  }
+
+  inline void observe_demand(uint64_t addr, bool cache_hit) {
+    pf_entry* e = pf_lookup(addr);
+    if (e == nullptr || e->demanded) return;
+    e->demanded = true;
+    if (!e->filled) {
+      // The prefetch was still in flight when the demand arrived: the hint
+      // was issued too late (or the distance is too short).
+      ++late_prefetches_;
+    } else if (cache_hit) {
+      ++useful_prefetches_;
+    }
+  }
+
+  inline double inflight_pressure_proxy() const {
+    // Used only when the local API exposes no MSHR occupancy (see file
+    // header): approximate pressure by our own in-flight prefetch count.
+    const double cap = static_cast<double>(HG_MSHR_PROXY_CAPACITY);
+    const double v = static_cast<double>(inflight_) / cap;
+    return (v > 1.0) ? 1.0 : v;
+  }
+
+  // ---- state --------------------------------------------------------------
+  site_state sites_[kSiteTableSize] = {};
+  pf_entry pf_table_[HG_PF_TABLE_SIZE] = {};
+  uint64_t phq_free_at_[(HG_PHQ_ENTRIES > 0) ? HG_PHQ_ENTRIES : 1] = {};
+
+  uint64_t cycle_ = 0;
+  bool cycle_operate_seen_ = false;
+
+  uint64_t accesses_ = 0;
+  uint64_t hints_seen_ = 0;
+  uint64_t prefetches_issued_ = 0;
+  uint64_t prefetches_dropped_ = 0;
+  uint64_t prefetches_rejected_ = 0;
+  uint64_t phq_full_events_ = 0;
+  uint64_t late_prefetches_ = 0;
+  uint64_t useful_prefetches_ = 0;
+  uint64_t prefetch_fills_ = 0;
+  uint64_t hints_dropped_full_ = 0;
+  uint64_t hints_dropped_mshr_ = 0;
+  uint64_t hints_no_prediction_ = 0;
+  uint64_t mshr_signal_missing_ = 0;
+  uint64_t inflight_ = 0;
+  uint64_t phq_occ_sum_ = 0;
+  uint64_t phq_occ_samples_ = 0;
+  std::size_t active_sites_ = 0;
+};
+
+}  // namespace hg
+
+// ===========================================================================
+// 5A. Adaptor for the modern (DPC4 / post-2024) class-based module API.
+//     Every hook is tiny, self-contained and templated on the ChampSim
+//     types, so a hook that the local ChampSim never calls costs nothing and
+//     a signature that changed still binds.
+// ===========================================================================
+#if HG_HAS_CHAMPSIM_MODULES
+
+struct hg_hint_gather_prefetcher : public champsim::modules::prefetcher {
+  using champsim::modules::prefetcher::prefetcher;
+
+  hg::engine hg_engine_;
+
+  // --- in-class shims ------------------------------------------------------
+  // `prefetch_line()` and `intern_` are protected members of the module base
+  // class, so these wrappers must be members of the derived class.  They keep
+  // the same prio<> overload trick: the highest viable overload wins and an
+  // API that does not exist simply falls through to the inert one.
+
+  template <typename AddrT>
+  inline auto hg_issue(AddrT addr, bool fill, uint32_t md, hg_detail::prio<3>)
+      -> decltype(void(this->prefetch_line(addr, fill, md)), bool{}) {
+    return static_cast<bool>(this->prefetch_line(addr, fill, md));
+  }
+  template <typename AddrT>
+  inline auto hg_issue(AddrT addr, bool fill, uint32_t md, hg_detail::prio<2>)
+      -> decltype(void(this->prefetch_line(addr, addr, addr, fill, md)),
+                  bool{}) {
+    return static_cast<bool>(this->prefetch_line(addr, addr, addr, fill, md));
+  }
+  template <typename AddrT>
+  inline bool hg_issue(AddrT, bool, uint32_t, hg_detail::prio<1>) {
+    return false;  // no injection API found: counted, but nothing is issued
+  }
+
+  template <typename Self>
+  static inline auto hg_pressure(Self* self, hg_detail::prio<2>)
+      -> decltype(hg_detail::mshr_ratio(self->intern_)) {
+    return hg_detail::mshr_ratio(self->intern_);
+  }
+  template <typename Self>
+  static inline double hg_pressure(Self*, hg_detail::prio<1>) {
+    return -1.0;  // engine falls back to the in-flight prefetch approximation
+  }
+
+  // --- hooks ---------------------------------------------------------------
+  inline void prefetcher_initialize() { hg_engine_.initialize(); }
+
+  template <typename AddrT, typename IpT, typename TypeT>
+  inline uint32_t prefetcher_cache_operate(AddrT addr, IpT ip,
+                                           uint8_t cache_hit,
+                                           bool /*useful_prefetch*/,
+                                           TypeT type, uint32_t metadata_in) {
+    const double pressure =
+        hg_pressure(this, hg_detail::prio<2>{});
+    hg_engine_.on_access(
+        hg_detail::to_u64(ip), hg_detail::to_u64(addr), cache_hit != 0,
+        hg_detail::to_int(type), pressure,
+        [this](uint64_t pf_addr, bool fill_this_level) {
+          return this->hg_issue(hg_detail::from_u64<AddrT>(pf_addr),
+                                fill_this_level, 0u, hg_detail::prio<3>{});
+        });
+    return metadata_in;
+  }
+
+  template <typename AddrT, typename SetT, typename WayT, typename EvictT>
+  inline uint32_t prefetcher_cache_fill(AddrT addr, SetT /*set*/, WayT /*way*/,
+                                        uint8_t prefetch, EvictT /*evicted*/,
+                                        uint32_t metadata_in) {
+    hg_engine_.on_fill(hg_detail::to_u64(addr), prefetch != 0);
+    return metadata_in;
+  }
+
+  inline void prefetcher_cycle_operate() { hg_engine_.on_cycle(); }
+
+  inline void prefetcher_final_stats() { hg_engine_.print_stats(std::cout); }
+};
+
+// Name aliases: ChampSim's generated build glue refers to the module by the
+// directory/module name CHIA chose.  Redeclaring an identical alias is legal,
+// so all of these can coexist.
+using hint_gather = hg_hint_gather_prefetcher;
+using hint_gather_prefetcher = hg_hint_gather_prefetcher;
+using hg_hint_gather = hg_hint_gather_prefetcher;
+#ifdef HG_MODULE_NAME
+using HG_MODULE_NAME = hg_hint_gather_prefetcher;
+#endif
+
+// ===========================================================================
+// 5B. Opt-in adaptor for the pre-module (DPC3-style) API, where the hooks are
+//     CACHE members.  Enable with -DHG_CHAMPSIM_LEGACY_API.
+// ===========================================================================
+#elif defined(HG_CHAMPSIM_LEGACY_API)
+
+namespace {
+inline hg::engine& hg_legacy_engine() {
+  static hg::engine e;
+  return e;
+}
+}  // namespace
+
+inline void CACHE::prefetcher_initialize() { hg_legacy_engine().initialize(); }
+
+inline uint32_t CACHE::prefetcher_cache_operate(uint64_t addr, uint64_t ip,
+                                                uint8_t cache_hit, uint8_t type,
+                                                uint32_t metadata_in) {
+  hg_legacy_engine().on_access(
+      ip, addr, cache_hit != 0, static_cast<int>(type),
+      hg_detail::mshr_ratio(this),
+      [this](uint64_t pf_addr, bool fill_this_level) {
+        return hg_detail::issue_prefetch(this, pf_addr, fill_this_level, 0u);
+      });
+  return metadata_in;
+}
+
+inline uint32_t CACHE::prefetcher_cache_fill(uint64_t addr, uint32_t, uint32_t,
+                                             uint8_t prefetch, uint64_t,
+                                             uint32_t metadata_in) {
+  hg_legacy_engine().on_fill(addr, prefetch != 0);
+  return metadata_in;
+}
+
+inline void CACHE::prefetcher_cycle_operate() { hg_legacy_engine().on_cycle(); }
+
+inline void CACHE::prefetcher_final_stats() {
+  hg_legacy_engine().print_stats(std::cout);
+}
+
+// ===========================================================================
+// 5C. No ChampSim in sight: the model above is still fully defined and
+//     compilable, which is what makes `-fsyntax-only` a valid smoke test.
+// ===========================================================================
+#endif  // HG_HAS_CHAMPSIM_MODULES
+
+#endif  // HINT_GATHER_PREFETCHER_H_

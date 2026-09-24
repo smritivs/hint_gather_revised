@@ -1,0 +1,49 @@
+======================================================================
+  HINT.GATHER Revised -- End-to-End Verification & Benchmark Suite
+======================================================================
+  Repo Root   : /google/src/cloud/svsoolebhavi/chia/google3/experimental/users/svsoolebhavi/hint_gather_revised
+  Tools Root  : /usr/local/google/home/svsoolebhavi/hg-tools
+  Conda Env   : /usr/local/google/home/svsoolebhavi/miniconda3/envs/hint-gather
+  Clang       : /usr/local/google/home/svsoolebhavi/hg-tools/llvm/bin/clang
+  Pass Plugin : /google/src/cloud/svsoolebhavi/chia/google3/experimental/users/svsoolebhavi/hint_gather_revised/llvm/build/libHintGather.so
+  gem5 Binary : /usr/local/google/home/svsoolebhavi/hg-tools/gem5/build/RISCV/gem5.opt
+----------------------------------------------------------------------
+
+========================================================================================================
+  8K Elements (L2-Resident Working Set)
+  Workload : gather  |  --size 8192 (96 KiB)  |  --iters 8  |  Genome: variant=chase, fanout=8, distance=64
+========================================================================================================
+  Hardware Metric (gem5 O3 stats.txt)   |  base (No PF) |  swpf (SW PF) |   hint gather | Improvement
+---------------------------------------+---------------+---------------+---------------+-------------------
+  simInsts (Dynamic Instructions)       |     1,208,611 |     1,331,504 |     1,044,801 | -13.55% insts
+  system.cpu.numCycles (Total Cycles)   |       500,241 |       500,669 |       445,339 | -54,902 cyc (+10.98%)
+  Cycle Savings vs swpf (SW Prefetch)   |            -- |       500,669 |       445,339 | -55,330 cyc (+11.05%)
+  dcache.demandMisses::total            |        63,557 |        63,630 |        27,597 | -35,960 misses
+  dcache.demandMshrMisses::total        |        44,280 |        44,260 |         6,173 | -86.06% (-38,107)
+  phq.hintsDispatched                   |             0 |             0 |         8,201 | 100% (8201/8201)
+  phq.chaseLoadsIssued (Index Loads)    |             0 |             0 |         4,104 | ChaseLine buffered
+  phq.prefetchesIssued                  |             0 |             0 |        65,440 | Active PHQ stream
+  PHQ Structural (iq / lsq / fu)        |     0 / 0 / 0 |     (nonzero) |     0 / 0 / 0 | PASS (Zero-Issue)
+  Architectural Checksum Equivalence    | 0xa279a8f479dab697 | 0xa279a8f479dab697 | 0xa279a8f479dab697 | EXACT MATCH
+========================================================================================================
+========================================================================================================
+  64K Elements (DRAM-Spilling Working Set)
+  Workload : gather  |  --size 65536 (768 KiB)  |  --iters 4  |  Genome: variant=chase, fanout=8, distance=64
+========================================================================================================
+  Hardware Metric (gem5 O3 stats.txt)   |  base (No PF) |  swpf (SW PF) |   hint gather | Improvement
+---------------------------------------+---------------+---------------+---------------+-------------------
+  simInsts (Dynamic Instructions)       |     5,910,903 |     6,369,664 |     5,255,561 | -11.09% insts
+  system.cpu.numCycles (Total Cycles)   |     2,716,193 |     2,833,816 |     2,553,537 | -162,656 cyc (+5.99%)
+  Cycle Savings vs swpf (SW Prefetch)   |            -- |     2,833,816 |     2,553,537 | -280,279 cyc (+9.89%)
+  dcache.demandMisses::total            |       441,350 |       440,570 |       222,541 | -218,809 misses
+  dcache.demandMshrMisses::total        |       321,908 |       321,912 |        73,782 | -77.08% (-248,126)
+  phq.hintsDispatched                   |             0 |             0 |        32,773 | 100% (32773/32773)
+  phq.chaseLoadsIssued (Index Loads)    |             0 |             0 |        16,388 | ChaseLine buffered
+  phq.prefetchesIssued                  |             0 |             0 |       262,088 | Active PHQ stream
+  PHQ Structural (iq / lsq / fu)        |     0 / 0 / 0 |     (nonzero) |     0 / 0 / 0 | PASS (Zero-Issue)
+  Architectural Checksum Equivalence    | 0xa01b22bcd093f9f4 | 0xa01b22bcd093f9f4 | 0xa01b22bcd093f9f4 | EXACT MATCH
+========================================================================================================
+
+========================================================================================================
+  GATE: PASS (All structural, functional, and performance checks passed)
+========================================================================================================

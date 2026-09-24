@@ -1,0 +1,136 @@
+# HINT.GATHER co-design loop -- CHIA cluster definition.
+#
+#   Usage
+#     ./scripts/setup_env.sh                 # one-time: env + toolchains
+#     conda activate hint-gather
+#     chia up cluster.yaml
+#     chia job submit --working-dir . -- python hint_gather_loop.py --stage full
+#     chia down cluster.yaml
+#
+# ---------------------------------------------------------------------------
+# Do you actually need this file?
+# ---------------------------------------------------------------------------
+# Probably not, at first.  The loop has a first-class single-process mode:
+#
+#     HG_LOCAL=1 python hint_gather_loop.py --stage full
+#
+# which calls the exact same @ChiaFunction nodes in-process (see
+# runner.submit()).  On a 48-core / 117 GB workstation that is faster than a
+# one-machine Ray cluster because it skips container startup and object-store
+# round trips, and it is far easier to debug.  Use this YAML when you have more
+# than one machine, or when you want the Ray dashboard's task timeline as a
+# figure for the paper.
+#
+# ---------------------------------------------------------------------------
+# Node types and why they are shaped this way
+# ---------------------------------------------------------------------------
+#   gem5_worker   -- docker (ghcr.io/ucb-bar/chia-gem5).  gem5 needs scons, a
+#                    matched protobuf, and a pile of system libraries; the CHIA
+#                    image already has all of them, which is the single biggest
+#                    time saving available here.  `gem5: 1` per worker because
+#                    a gem5 O3 run is single-threaded and RAM-hungry; scale by
+#                    adding workers, not by raising the count.
+#   llvm_worker   -- NO docker.  There is no CHIA LLVM image, and we do not
+#                    build LLVM anyway (prebuilt release + out-of-tree pass
+#                    plugin, see docs/DESIGN.md sec 6.2), so a bare worker running
+#                    the `hint-gather` conda env is both sufficient and lighter.
+#                    `llvm: 8` because pass-plugin and benchmark builds are
+#                    seconds long and embarrassingly parallel.
+#   champsim_work -- NO docker, same reasoning: ChampSim is a self-contained
+#                    C++17 tree that builds with the conda toolchain.
+#                    `champsim: 12` -- the fast evaluator is the throughput
+#                    bottleneck of the whole loop, so oversubscribe it.
+#   llm_worker    -- holds the `vertex_creds` resource that
+#                    chia.models.vertex.VertexGeminiLLM.prompt requires.  0.01
+#                    is charged per prompt, so `vertex_creds: 1` already allows
+#                    100 concurrent calls; the cap here exists to keep us under
+#                    the Vertex QPS quota, not to model hardware.
+#
+# SITE-SPECIFIC -- edit before first use:
+#   * ${THIS_MACHINE} and ${USER} are substituted by `chia up`.  To span
+#     several machines, replace the compatible_ips lists with real hostnames
+#     and raise num_workers.
+#   * The llm_worker needs Application Default Credentials for Vertex.  Run
+#     `gcloud auth application-default login` and set GOOGLE_CLOUD_PROJECT
+#     before `chia up`.  Switch HG_LLM_BACKEND to claude/opencode/codex and the
+#     resource name below to claude_creds/opencode_creds/codex_creds to use a
+#     different harness (see nodes/agents.py:make_llm).
+#   * HG_TOOLS_ROOT must name a path visible to every worker.  On a single
+#     machine the default (~/hg-tools) is fine; across machines make it NFS.
+
+cluster_name: hint-gather
+
+provider:
+    head_ip: ${THIS_MACHINE}
+
+auth:
+    ssh_user: ${USER}
+    # ssh_private_key: ~/.ssh/<key>    # omit if your key is in ssh-agent
+
+available_node_types:
+
+    gem5_worker:
+        resources: {"gem5": 1}
+        num_workers: 6
+        compatible_ips: ["${THIS_MACHINE}"]
+        docker:
+            image: "ghcr.io/ucb-bar/chia-gem5:latest"
+            container_name: "hg-gem5-${USER}"
+            pull_before_run: True
+            pull_timeout: 3600
+            run_options:
+                - --ulimit nofile=65536:65536
+                - --shm-size=10.24gb
+                # The gem5 checkout, the benchmark ELFs and the run outputs all
+                # live under HG_TOOLS_ROOT / the repo, so both must be visible
+                # inside the container at the SAME path the head resolves them
+                # to -- config.py hands absolute paths to the workers.
+                - "-v ${HOME}/hg-tools:${HOME}/hg-tools"
+                - "-v ${HOME}:${HOME}"
+                - "-e HG_TOOLS_ROOT=${HOME}/hg-tools"
+                - "-v $SSH_AUTH_SOCK:/ssh-agent"
+                - "-e SSH_AUTH_SOCK=/ssh-agent"
+
+    llvm_worker:
+        # No docker: prebuilt LLVM + out-of-tree plugin builds fine in the
+        # conda env.  See the header comment.
+        resources: {"llvm": 8}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        worker_setup_commands:
+            - source ~/.bashrc && conda activate hint-gather
+            - source ${HOME}/hg-tools/env.sh
+
+    champsim_worker:
+        resources: {"champsim": 12}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        worker_setup_commands:
+            - source ~/.bashrc && conda activate hint-gather
+            - source ${HOME}/hg-tools/env.sh
+
+    llm_worker:
+        # Resource name must match the backend selected by HG_LLM_BACKEND:
+        #   vertex -> vertex_creds | claude -> claude_creds
+        #   opencode -> opencode_creds | codex -> codex_creds
+        resources: {"vertex_creds": 1}
+        num_workers: 1
+        compatible_ips: ["${THIS_MACHINE}"]
+        worker_setup_commands:
+            - source ~/.bashrc && conda activate hint-gather
+            - source ${HOME}/hg-tools/env.sh
+
+head_env_commands: ["source ~/.bashrc && conda activate hint-gather"]
+head_setup_commands: ["source ~/.bashrc && conda activate hint-gather"]
+
+worker_setup_commands: []
+
+head_start_ray_commands:
+    - source ~/.bashrc && conda activate hint-gather && ray stop
+    - source ~/.bashrc && conda activate hint-gather && ulimit -c unlimited &&
+      ray start --head --port=6379 --include-dashboard=True
+      --dashboard-agent-listen-port=0
+
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0

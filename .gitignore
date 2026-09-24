@@ -1,0 +1,30 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Build directories & compiled binaries
+llvm/build/
+bench/build/
+champsim/test_sidecar
+champsim/hint_gather_prefetcher.h
+*.so
+*.o
+*.a
+*.elf
+
+# Runtime outputs, gem5 outdirs, SQLite DBs & scratch files
+runs/
+hint_sites.json
+hg_profile.json
+
+# External toolchains if cloned inside repo
+toolchain/
+hg-tools/
+miniconda3/
+
+# OS / Editor files
+.DS_Store
+*.swp
+*~

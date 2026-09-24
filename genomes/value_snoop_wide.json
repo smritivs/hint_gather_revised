@@ -1,0 +1,20 @@
+{
+  "hint_distance": 383,
+  "fanout": 2,
+  "entropy_threshold": 0.876,
+  "variant": "value",
+  "prefetch_level": "L1D",
+  "droppable": false,
+  "phq_entries": 8,
+  "phq_dispatch_width": 2,
+  "phq_poll_limit": 63,
+  "wakeup_policy": "tag_snoop",
+  "tlb_miss_policy": "drop",
+  "mshr_pressure_threshold": 0.863,
+  "max_hints_per_loop": 2,
+  "min_trip_count": 16,
+  "origin": "seed",
+  "parent_id": "",
+  "generation": 0,
+  "notes": ""
+}

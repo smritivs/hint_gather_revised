@@ -1,0 +1,20 @@
+{
+  "droppable": true,
+  "entropy_threshold": 0.35,
+  "fanout": 8,
+  "generation": 1,
+  "hint_distance": 64,
+  "max_hints_per_loop": 1,
+  "min_trip_count": 64,
+  "mshr_pressure_threshold": 0.90,
+  "notes": "revised co-design genome: fanout=8 strip-mined chase, d=64, 32 PHQ entries",
+  "origin": "revised",
+  "parent_id": "seed",
+  "phq_dispatch_width": 4,
+  "phq_entries": 32,
+  "phq_poll_limit": 32,
+  "prefetch_level": "L1D",
+  "tlb_miss_policy": "drop",
+  "variant": "chase",
+  "wakeup_policy": "poll_rf"
+}
