@@ -63,68 +63,16 @@ def ensure_kernel_binaries(genome_path: Path) -> Path:
     bin_dir = REPO_ROOT / "runs" / "verify_bins"
     bin_dir.mkdir(parents=True, exist_ok=True)
     bench_dir = REPO_ROOT / "bench"
-    sysroot_candidates = [
-        config.CONDA_PREFIX / "riscv-tools" / "riscv64-unknown-elf",
-        config.CONDA_PREFIX / "riscv64-unknown-elf",
-    ]
-    sysroot = next((p for p in sysroot_candidates if p.is_dir()), sysroot_candidates[0])
-    gcc_tc = sysroot.parent
 
-    common_flags = [
-        str(config.CLANG),
-        "--target=riscv64-unknown-elf",
-        "-march=rv64gc",
-        "-mabi=lp64d",
-        "-static",
-        f"--sysroot={sysroot}",
-        "-isystem",
-        f"{sysroot}/include",
-        f"--gcc-toolchain={gcc_tc}",
-        "-O2",
-        "-std=c99",
-        "-DHG_SWPF_DISTANCE=32",
-        f"-I{REPO_ROOT / 'llvm' / 'include'}",
-        f"-I{bench_dir}",
-    ]
+    _run([
+        "make",
+        "-C", str(bench_dir),
+        f"BUILD_DIR={bin_dir.resolve()}",
+        f"REPORT_DIR={bin_dir.resolve()}",
+        f"HG_GENOME={genome_path.resolve()}",
+        "riscv"
+    ])
 
-    _run(
-        common_flags
-        + [
-            "-DHG_BUILD_BASE=1",
-            str(bench_dir / "gather.c"),
-            "-o",
-            str(bin_dir / "gather.base.elf"),
-        ]
-    )
-    _run(
-        common_flags
-        + [
-            "-DHG_BUILD_SWPF=1",
-            str(bench_dir / "gather.c"),
-            "-o",
-            str(bin_dir / "gather.swpf.elf"),
-        ]
-    )
-    _run(
-        common_flags
-        + [
-            "-DHG_BUILD_HINT=1",
-            "-Xclang",
-            "-load",
-            "-Xclang",
-            str(config.PASS_PLUGIN),
-            f"-fpass-plugin={config.PASS_PLUGIN}",
-            "-mllvm",
-            f"-hg-genome={genome_path}",
-            "-mllvm",
-            "-hg-mode=emit",
-            "-mllvm",
-            f"-hg-report={bin_dir / 'hint_sites.json'}",
-            str(bench_dir / "gather.c"),
-            "-o",
-            str(bin_dir / "gather.hint.elf"),
-        ]
-    )
     return bin_dir
 
 
@@ -347,6 +295,7 @@ def main() -> int:
     _run(["make", "-C", str(REPO_ROOT / "bench"), "riscv", "check"])
     bin_dir = ensure_kernel_binaries(genome_path)
     objdump_candidates = [
+        config.TOOLS_ROOT / "riscv" / "bin" / "riscv64-unknown-elf-objdump",
         config.CONDA_PREFIX / "riscv-tools" / "bin" / "riscv64-unknown-elf-objdump",
         config.CONDA_PREFIX / "bin" / "riscv64-unknown-elf-objdump",
     ]

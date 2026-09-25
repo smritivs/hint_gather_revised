@@ -483,4 +483,683 @@ REGIONS: List[Region] = [
         why="Add isHintGather() and the ISA-agnostic hintGatherFields() hook.",
         requires=("class StaticInst :",),
     ),
+    Region(
+        rid="CPU_INCLUDE",
+        path="src/cpu/o3/cpu.hh",
+        anchors=[
+            '#include "cpu/o3/scoreboard.hh"',
+            '#include "cpu/o3/rob.hh"',
+        ],
+        where="after",
+        body=BODY_CPU_INCLUDE,
+        comment="//",
+        indent="",
+        why="Make PrefetchHintQueue visible to every O3 translation unit.",
+    ),
+    Region(
+        rid="CPU_MEMBERS",
+        path="src/cpu/o3/cpu.hh",
+        anchors=[
+            "    BaseMMU *mmu;\n    using LSQRequest = LSQ::LSQRequest;",
+            "    BaseMMU *mmu;",
+        ],
+        where="after",
+        body=BODY_CPU_MEMBERS,
+        comment="//",
+        indent="    ",
+        why=(
+            "Add the phq member plus the four accessors the PHQ needs "
+            "(scoreboard read port, register read, thread context, "
+            "D-cache port)."
+        ),
+        requires=("class CPU : public BaseCPU",),
+    ),
+    Region(
+        rid="CPU_INIT",
+        path="src/cpu/o3/cpu.cc",
+        anchors=[
+            "    fetch.setActiveThreads(&activeThreads);",
+        ],
+        where="before",
+        body=BODY_CPU_INIT,
+        comment="//",
+        indent="    ",
+        why="Wire the PHQ to its CPU in the o3::CPU constructor.",
+        requires=("CPU::CPU(const BaseO3CPUParams &params)",),
+    ),
+    Region(
+        rid="CPU_PARAM_IMPORT",
+        path="src/cpu/o3/BaseO3CPU.py",
+        anchors=[
+            "from m5.objects.FUPool import *",
+        ],
+        where="after",
+        body=BODY_CPU_PARAM_IMPORT,
+        comment="#",
+        indent="",
+        why="Import PrefetchHintQueue into the BaseO3CPU param namespace.",
+    ),
+    Region(
+        rid="CPU_PARAM",
+        path="src/cpu/o3/BaseO3CPU.py",
+        anchors=[
+            '    needsTSO = Param.Bool(False, "Enable TSO Memory model")',
+        ],
+        where="after",
+        body=BODY_CPU_PARAM,
+        comment="#",
+        indent="    ",
+        why="Declare the cpu.phq parameter (this is what names the stat group).",
+        requires=("class BaseO3CPU(BaseCPU):",),
+    ),
+    Region(
+        rid="SCONS",
+        path="src/cpu/o3/SConscript",
+        anchors=[
+            "    Source('rob.cc')",
+            '    Source("rob.cc")',
+        ],
+        where="after",
+        body=BODY_SCONS,
+        comment="#",
+        indent="    ",
+        why="Register the new SimObject, source file and debug flag.",
+    ),
+    Region(
+        rid="IEW_DISPATCH",
+        path="src/cpu/o3/iew.cc",
+        anchors=[
+            "        } else if (inst->isNop()) {",
+        ],
+        where="before",
+        body=BODY_IEW_DISPATCH,
+        comment="//",
+        indent="        ",
+        why=(
+            "THE core edit: route HINT.GATHER to the PHQ and mark it "
+            "complete, without touching the IQ, the LSQ or the FU pool."
+        ),
+        requires=("IEW::dispatchInsts(ThreadID tid)", "add_to_iq"),
+    ),
+    Region(
+        rid="IEW_SQUASH",
+        path="src/cpu/o3/iew.cc",
+        anchors=[
+            "    ldstQueue.squash(fromCommit->commitInfo[tid].doneSeqNum, tid);",
+        ],
+        where="after",
+        body=BODY_IEW_SQUASH,
+        comment="//",
+        indent="    ",
+        why="Invalidate PHQ entries younger than the squash point.",
+        requires=("IEW::squash(ThreadID tid)",),
+    ),
+    Region(
+        rid="IQ_ALLOC",
+        path="src/cpu/o3/inst_queue.cc",
+        anchors=[
+            "InstructionQueue::insert(const DynInstPtr &new_inst)\n{",
+        ],
+        where="after",
+        body=BODY_IQ_ALLOC,
+        comment="//",
+        indent="    ",
+        why="Structural assertion: count IQ entries taken by a HINT.GATHER.",
+    ),
+    Region(
+        rid="IQ_ALLOC_NONSPEC",
+        path="src/cpu/o3/inst_queue.cc",
+        anchors=[
+            "InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)\n{",
+        ],
+        where="after",
+        body=BODY_IQ_ALLOC,
+        comment="//",
+        indent="    ",
+        why="Structural assertion: the non-speculative IQ path as well.",
+    ),
+    Region(
+        rid="FU_GRANT",
+        path="src/cpu/o3/inst_queue.cc",
+        anchors=[
+            "        int idx = FUPool::NoCapableFU;",
+        ],
+        where="before",
+        body=BODY_FU_GRANT,
+        comment="//",
+        indent="        ",
+        why="Structural assertion: count FU port cycles taken by a HINT.GATHER.",
+        requires=("issuing_inst",),
+    ),
+    Region(
+        rid="LSQ_ALLOC",
+        path="src/cpu/o3/lsq_unit.cc",
+        anchors=[
+            "LSQUnit::insert(const DynInstPtr &inst)\n{",
+        ],
+        where="after",
+        body=BODY_LSQ_ALLOC,
+        comment="//",
+        indent="    ",
+        why="Structural assertion: count LSQ entries taken by a HINT.GATHER.",
+    ),
+    Region(
+        rid="LSQ_RESP_INTERCEPT",
+        path="src/cpu/o3/lsq.cc",
+        anchors=[
+            "LSQ::DcachePort::recvTimingResp(PacketPtr pkt)\n{",
+        ],
+        where="after",
+        body=BODY_LSQ_RESP_INTERCEPT,
+        comment="//",
+        indent="    ",
+        why=(
+            "Claim PHQ responses before LSQ::recvTimingResp() panics on "
+            "their sender state, and observe demand responses for "
+            "prefetchesLate."
+        ),
+    ),
+    Region(
+        rid="RENAME_INVARIANTS",
+        path="src/cpu/o3/rename.cc",
+        anchors=[
+            "        renameDestRegs(inst, inst->threadNumber);",
+        ],
+        where="after",
+        body=BODY_RENAME_INVARIANTS,
+        comment="//",
+        indent="        ",
+        why="Assert zero destination registers and non-memory-ref at rename.",
+        requires=("Rename::renameInsts(ThreadID tid)",),
+    ),
+    Region(
+        rid="ROB_ALLOC",
+        path="src/cpu/o3/rob.cc",
+        anchors=[
+            "ROB::insertInst(const DynInstPtr &inst)\n{",
+        ],
+        where="after",
+        body=BODY_ROB_ALLOC,
+        comment="//",
+        indent="    ",
+        why=(
+            "Positive control: count the one structure a HINT.GATHER is "
+            "supposed to occupy."
+        ),
+    ),
+    Region(
+        rid="ISA_FORMAT_INCLUDE",
+        path="src/arch/riscv/isa/formats/formats.isa",
+        anchors=[
+            '##include "vector_mem.isa"',
+            '##include "compressed.isa"',
+        ],
+        where="after",
+        body=BODY_ISA_FORMAT_INCLUDE,
+        comment="//",
+        indent="",
+        why="Pull the new HintGatherOp format into the RISC-V ISA description.",
+    ),
+    Region(
+        rid="ISA_DECODE",
+        path="src/arch/riscv/isa/decoder.isa",
+        anchors=[
+            "    0x3: decode OPCODE5 {",
+        ],
+        where="after",
+        body=BODY_ISA_DECODE,
+        comment="//",
+        indent="        ",
+        why="Decode opcode 0x0B (custom-0) as HINT.GATHER.",
+        requires=("decode QUADRANT default Unknown::unknown() {",),
+    ),
 ]
+
+
+# ==========================================================================
+#  Machinery
+# ==========================================================================
+
+
+class PatchError(Exception):
+    """Raised with a message intended to be read by a human or an LLM."""
+
+
+def _read(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write(path: str, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _abs(root: str, rel: str) -> str:
+    return os.path.join(root, rel)
+
+
+def _is_applied(text: str, region: Region) -> bool:
+    return f"{MARKER_PREFIX} {region.rid}" in text
+
+
+def _has_orphan_end(text: str, region: Region) -> bool:
+    return (f"{MARKER_SUFFIX} {region.rid}" in text) and not _is_applied(
+        text, region
+    )
+
+
+def _pick_anchor(text: str, region: Region) -> Optional[str]:
+    """Return the first anchor candidate occurring exactly once."""
+    for candidate in region.anchors:
+        if text.count(candidate) == 1:
+            return candidate
+    return None
+
+
+def _anchor_diagnosis(text: str, region: Region) -> str:
+    """A precise, actionable description of why no anchor matched."""
+    lines = [
+        f"  region      : {region.rid}",
+        f"  file        : {region.path}",
+        f"  purpose     : {region.why}",
+        "  anchors tried (each must occur EXACTLY once):",
+    ]
+    for candidate in region.anchors:
+        n = text.count(candidate)
+        shown = candidate.replace("\n", "\\n")
+        verdict = "OK" if n == 1 else ("NOT FOUND" if n == 0 else f"{n} matches")
+        lines.append(f"    [{verdict:>10}] {shown!r}")
+        if n == 0:
+            near = _nearest_line(text, candidate)
+            if near:
+                lines.append(f"                 closest line in file: {near!r}")
+    lines.append(
+        "  fix         : edit the `anchors` list for this region in "
+        "apply_phq.py so that it matches text that appears exactly once "
+        "in this gem5 version, or insert the region body by hand between "
+        f"`{region.comment} {MARKER_PREFIX} {region.rid}` and "
+        f"`{region.comment} {MARKER_SUFFIX} {region.rid}`."
+    )
+    return "\n".join(lines)
+
+
+def _nearest_line(text: str, needle: str) -> Optional[str]:
+    """Best-effort: the existing line most similar to the anchor's first line."""
+    first = needle.split("\n", 1)[0].strip()
+    if not first:
+        return None
+    best = difflib.get_close_matches(
+        first, [ln.strip() for ln in text.splitlines()], n=1, cutoff=0.6
+    )
+    return best[0] if best else None
+
+
+def _insert(text: str, region: Region, anchor: str) -> str:
+    idx = text.index(anchor)
+    block = region.block()
+    if region.where == "after":
+        end = idx + len(anchor)
+        # Consume the rest of the anchor's final line so we insert on a
+        # clean line boundary.
+        nl = text.find("\n", end)
+        if nl == -1:
+            return text + "\n" + block
+        return text[: nl + 1] + block + text[nl + 1 :]
+    elif region.where == "before":
+        # Rewind to the start of the anchor's first line.
+        bol = text.rfind("\n", 0, idx) + 1
+        return text[:bol] + block + text[bol:]
+    raise PatchError(f"region {region.rid}: bad `where` value {region.where!r}")
+
+
+def _remove(text: str, region: Region) -> Tuple[str, bool]:
+    """Remove every BEGIN..END block for this region id. Idempotent."""
+    begin_tag = f"{MARKER_PREFIX} {region.rid}"
+    end_tag = f"{MARKER_SUFFIX} {region.rid}"
+    changed = False
+    while True:
+        b = text.find(begin_tag)
+        if b == -1:
+            break
+        e = text.find(end_tag, b)
+        if e == -1:
+            raise PatchError(
+                f"{region.path}: found `{begin_tag}` with no matching "
+                f"`{end_tag}`. The file has been hand-edited; remove the "
+                f"dangling marker before reverting."
+            )
+        bol = text.rfind("\n", 0, b) + 1
+        eol = text.find("\n", e)
+        eol = len(text) if eol == -1 else eol + 1
+        text = text[:bol] + text[eol:]
+        changed = True
+    return text, changed
+
+
+# --------------------------------------------------------------------------
+# Pre-flight
+# --------------------------------------------------------------------------
+def validate_root(root: str) -> None:
+    if not os.path.isdir(root):
+        raise PatchError(f"--gem5-root {root!r} is not a directory")
+    sentinel = os.path.join(root, "src", "cpu", "o3", "iew.cc")
+    if not os.path.isfile(sentinel):
+        raise PatchError(
+            f"--gem5-root {root!r} does not look like a gem5 checkout: "
+            f"{sentinel} is missing. Point --gem5-root at the directory "
+            f"that contains SConstruct, src/ and configs/."
+        )
+    if not os.path.isfile(os.path.join(root, "SConstruct")):
+        raise PatchError(
+            f"--gem5-root {root!r} has src/cpu/o3/iew.cc but no SConstruct. "
+            f"Point --gem5-root at the top of the gem5 source tree."
+        )
+
+
+def validate_payload() -> None:
+    missing = [
+        src for src, _ in NEW_FILES if not os.path.isfile(os.path.join(SCRIPT_DIR, src))
+    ]
+    if missing:
+        raise PatchError(
+            "apply_phq.py cannot find its own payload files: "
+            + ", ".join(missing)
+            + f" (looked under {SCRIPT_DIR}). Run the script from inside the "
+            "hint_gather/gem5 directory, or restore the missing files."
+        )
+
+
+def validate_region_ids() -> None:
+    seen = set()
+    for r in REGIONS:
+        key = (r.path, r.rid)
+        if key in seen:
+            raise PatchError(f"duplicate region id {r.rid} for {r.path}")
+        seen.add(key)
+
+
+# --------------------------------------------------------------------------
+# Actions
+# --------------------------------------------------------------------------
+def do_apply(root: str, dry_run: bool, verbose: bool) -> int:
+    validate_payload()
+
+    # Phase 1: verify EVERY region can be placed before writing anything.
+    # A half-applied tree is the worst outcome for the repair loop.
+    plan = []
+    for region in REGIONS:
+        path = _abs(root, region.path)
+        if not os.path.isfile(path):
+            raise PatchError(
+                f"region {region.rid}: {region.path} does not exist under "
+                f"{root}. This gem5 version does not have the file this "
+                f"patch expects; see gem5/README.md 'If the build fails'."
+            )
+        text = _read(path)
+
+        if _has_orphan_end(text, region):
+            raise PatchError(
+                f"region {region.rid}: {region.path} contains an END marker "
+                f"with no BEGIN marker. Remove the dangling marker by hand."
+            )
+        if _is_applied(text, region):
+            plan.append((region, path, None))
+            continue
+
+        for needed in region.requires:
+            if needed not in text:
+                raise PatchError(
+                    f"region {region.rid}: {region.path} does not contain the "
+                    f"expected text {needed!r}. Either this is not the file "
+                    f"we think it is, or the gem5 version is unsupported.\n"
+                    f"{_anchor_diagnosis(text, region)}"
+                )
+
+        anchor = _pick_anchor(text, region)
+        if anchor is None:
+            raise PatchError(
+                "could not place a HINT.GATHER region -- no anchor matched "
+                "exactly once.\n" + _anchor_diagnosis(text, region)
+            )
+        plan.append((region, path, anchor))
+
+    # Phase 2: write.
+    n_new, n_skipped = 0, 0
+    for region, path, anchor in plan:
+        if anchor is None:
+            n_skipped += 1
+            if verbose:
+                print(f"  = {region.path:<42} {region.rid} (already applied)")
+            continue
+        text = _read(path)
+        new_text = _insert(text, region, anchor)
+        if not dry_run:
+            _write(path, new_text)
+        n_new += 1
+        print(f"  + {region.path:<42} {region.rid}")
+
+    # Phase 3: new files.
+    n_copied = 0
+    for src_rel, dst_rel in NEW_FILES:
+        src = os.path.join(SCRIPT_DIR, src_rel)
+        dst = _abs(root, dst_rel)
+        payload = _read(src)
+        if os.path.isfile(dst) and _read(dst) == payload:
+            if verbose:
+                print(f"  = {dst_rel:<42} (identical)")
+            continue
+        if not dry_run:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+        n_copied += 1
+        print(f"  + {dst_rel:<42} (copied)")
+
+    # Phase 4: ensure SConstruct disables -Werror so GCC 12-15 (Debian, Ubuntu,
+    # Arch Linux) do not fail on standard library warnings in gem5 v24.0.0.1.
+    sconstruct_path = _abs(root, "SConstruct")
+    if os.path.isfile(sconstruct_path):
+        sc_text = _read(sconstruct_path)
+        if "CCFLAGS=['-Werror'," in sc_text:
+            if not dry_run:
+                _write(
+                    sconstruct_path,
+                    sc_text.replace("CCFLAGS=['-Werror',", "CCFLAGS=['-Wno-error',"),
+                )
+            print(f"  + {'SConstruct':<42} (-Wno-error enabled)")
+
+    print(
+        f"\nHINT.GATHER applied to {root}\n"
+        f"  regions inserted : {n_new}\n"
+        f"  regions already present : {n_skipped}\n"
+        f"  files copied     : {n_copied}"
+    )
+    if dry_run:
+        print("  (--dry-run: nothing was written)")
+    else:
+        print(
+            "\nNow build:\n"
+            "  scons build/RISCV/gem5.opt -j$(nproc)\n"
+            "See gem5/README.md for the correctness gate and the stat names."
+        )
+    return 0
+
+
+def do_revert(root: str, dry_run: bool, verbose: bool) -> int:
+    n_regions, n_files = 0, 0
+    # Group by file so each file is read/written once.
+    by_path = {}
+    for region in REGIONS:
+        by_path.setdefault(region.path, []).append(region)
+
+    for rel, regions in by_path.items():
+        path = _abs(root, rel)
+        if not os.path.isfile(path):
+            if verbose:
+                print(f"  ? {rel:<42} (absent, skipped)")
+            continue
+        text = _read(path)
+        original = text
+        for region in regions:
+            text, changed = _remove(text, region)
+            if changed:
+                n_regions += 1
+                print(f"  - {rel:<42} {region.rid}")
+        if text != original and not dry_run:
+            _write(path, text)
+
+    for _, dst_rel in NEW_FILES:
+        dst = _abs(root, dst_rel)
+        if os.path.isfile(dst):
+            if not dry_run:
+                os.remove(dst)
+            n_files += 1
+            print(f"  - {dst_rel:<42} (deleted)")
+
+    print(
+        f"\nHINT.GATHER reverted from {root}\n"
+        f"  regions removed : {n_regions}\n"
+        f"  files deleted   : {n_files}"
+    )
+    if dry_run:
+        print("  (--dry-run: nothing was written)")
+    else:
+        print(
+            "\nThe tree should now be byte-identical to stock gem5. Verify "
+            "with `git diff` / `git status` if it is a git checkout."
+        )
+    return 0
+
+
+def do_check(root: str, verbose: bool) -> int:
+    applied, missing, broken = [], [], []
+
+    for region in REGIONS:
+        path = _abs(root, region.path)
+        if not os.path.isfile(path):
+            broken.append((region, "file does not exist"))
+            continue
+        text = _read(path)
+        if _has_orphan_end(text, region):
+            broken.append((region, "END marker without BEGIN marker"))
+        elif _is_applied(text, region):
+            if f"{MARKER_SUFFIX} {region.rid}" not in text:
+                broken.append((region, "BEGIN marker without END marker"))
+            else:
+                applied.append(region)
+        else:
+            missing.append(region)
+
+    files_ok, files_missing, files_stale = [], [], []
+    for src_rel, dst_rel in NEW_FILES:
+        src = os.path.join(SCRIPT_DIR, src_rel)
+        dst = _abs(root, dst_rel)
+        if not os.path.isfile(dst):
+            files_missing.append(dst_rel)
+        elif not os.path.isfile(src):
+            files_stale.append(f"{dst_rel} (payload source missing)")
+        elif _read(dst) != _read(src):
+            files_stale.append(dst_rel)
+        else:
+            files_ok.append(dst_rel)
+
+    total_regions = len(REGIONS)
+    total_files = len(NEW_FILES)
+
+    print(f"HINT.GATHER status for {root}")
+    print(f"  regions applied : {len(applied)}/{total_regions}")
+    print(f"  files installed : {len(files_ok)}/{total_files}")
+
+    if verbose or missing or broken or files_missing or files_stale:
+        for region in applied:
+            print(f"    [ OK      ] {region.path:<42} {region.rid}")
+        for region in missing:
+            print(f"    [ MISSING ] {region.path:<42} {region.rid}")
+        for region, reason in broken:
+            print(
+                f"    [ BROKEN  ] {region.path:<42} {region.rid}  -- {reason}"
+            )
+        for f in files_ok:
+            if verbose:
+                print(f"    [ OK      ] {f}")
+        for f in files_missing:
+            print(f"    [ MISSING ] {f}")
+        for f in files_stale:
+            print(f"    [ STALE   ] {f}  -- differs from payload; re-apply")
+
+    fully = (
+        len(applied) == total_regions
+        and len(files_ok) == total_files
+        and not broken
+    )
+    none_at_all = (
+        not applied and not broken and len(files_missing) == total_files
+    )
+
+    if fully:
+        print("\nGATE: APPLIED")
+        return 0
+    if none_at_all:
+        print("\nGATE: NOT-APPLIED")
+        return 2
+    print(
+        "\nGATE: PARTIALLY-APPLIED\n"
+        "Re-run without --check to install the missing regions (existing "
+        "regions are left alone), or --revert first for a clean slate."
+    )
+    return 3
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="apply_phq.py",
+        description=(
+            "Install, check or remove the HINT.GATHER Prefetch Hint Queue "
+            "in a gem5 checkout. Idempotent and fully reversible; see "
+            "docs/DESIGN.md 4.2."
+        ),
+    )
+    p.add_argument(
+        "--gem5-root",
+        required=True,
+        help="Top of the gem5 source tree (the directory with SConstruct).",
+    )
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--revert",
+        action="store_true",
+        help="Remove every HINT.GATHER region and delete the copied files.",
+    )
+    mode.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Report applied / not-applied / partially-applied. "
+            "Exit 0 / 2 / 3 respectively."
+        ),
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Say what would change without writing anything.",
+    )
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args(argv)
+
+    root = os.path.abspath(os.path.expanduser(args.gem5_root))
+
+    try:
+        validate_region_ids()
+        validate_root(root)
+        if args.check:
+            return do_check(root, args.verbose)
+        if args.revert:
+            return do_revert(root, args.dry_run, args.verbose)
+        return do_apply(root, args.dry_run, args.verbose)
+    except PatchError as e:
+        print(f"\napply_phq.py: ERROR\n{e}\n", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
