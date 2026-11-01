@@ -181,6 +181,9 @@ class PrefetchHintQueue : public ClockedObject
         /** Cycles this entry has actually been polled. 8b. */
         uint8_t pollCount = 0;
 
+        /** v8: cycles spent retrying a refused D-cache port. 7b. */
+        uint8_t portRetries = 0;
+
         /** Which of the (fanout + 1) prefetches have been issued. 3b. */
         uint8_t issued = 0;
 
@@ -399,6 +402,10 @@ class PrefetchHintQueue : public ClockedObject
     const unsigned scoreboardReadPorts;
     /** Adds per cycle on the dedicated adder. DESIGN.md 1.4 / 2. */
     const unsigned adderThroughput;
+    /** v8: retry budget (cycles) for a refused D-cache port; 0 = drop. */
+    const unsigned portRetryLimit;
+    /** v8: set by sendRequest() when the port (not translation) refused. */
+    bool lastSendPortBlocked = false;
     /**
      * Number of L1D MSHRs. The config script must keep this equal to
      * `cpu.dcache.mshrs`; BaseCache::mshrQueue is protected and there is no
@@ -528,6 +535,10 @@ class PrefetchHintQueue : public ClockedObject
         statistics::Scalar translationFailures;
         /** Times the shared D-cache port refused a PHQ request. */
         statistics::Scalar portBlocked;
+        /** v8: refusals answered by keeping the entry and retrying. */
+        statistics::Scalar portRetries;
+        /** v8: hints dropped because the port stayed blocked (after retries). */
+        statistics::Scalar portDrops;
         /** Prefetches requested at L2 (see README: level is advisory). */
         statistics::Scalar prefetchesRequestedL2;
     } phqStats;
