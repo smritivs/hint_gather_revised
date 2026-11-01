@@ -95,7 +95,7 @@ def build_parser():
     # ---- cache hierarchy ------------------------------------------------
     p.add_argument("--l1i-size", default="32kB")
     p.add_argument("--l1d-size", default="32kB")
-    p.add_argument("--l2-size", default="1MB")
+    p.add_argument("--l2-size", default="256kB")
     p.add_argument("--l1d-mshrs", type=int, default=32)
     p.add_argument("--cacheline-size", type=int, default=64)
     p.add_argument(
