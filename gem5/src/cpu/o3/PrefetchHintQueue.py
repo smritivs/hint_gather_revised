@@ -75,6 +75,14 @@ class PrefetchHintQueue(ClockedObject):
         "(genome: phq_poll_limit, 1..64)",
     )
 
+    # v8: hold-and-retry on a refused D-cache port (0 = drop immediately,
+    # which is the v7 behaviour).
+    phq_port_retry_limit = Param.Unsigned(
+        0,
+        "Cycles a Ready entry may retry a prefetch the shared D-cache port "
+        "refused before the hint is dropped (0 = drop at once)",
+    )
+
     wakeup_policy = Param.String(
         "poll_rf",
         "How a waiting entry learns its operand is ready (genome: "
