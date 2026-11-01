@@ -150,6 +150,8 @@ def build_parser():
     # DESIGN.md behaviour exactly. Documented in gem5/README.md.
     p.add_argument("--phq-scoreboard-read-ports", type=int, default=2)
     p.add_argument("--phq-adder-throughput", type=int, default=8)
+    p.add_argument("--phq-port-retry-limit", type=int, default=0,
+        help="v8: cycles to retry a refused D-cache port (0 = drop)")
 
     return p
 
@@ -242,6 +244,8 @@ def build_system(args):
         )
 
         system.l2cache = L2Cache(size=args.l2_size)
+            if args.l2_prefetcher == "stride":
+                system.l2cache.prefetcher = StridePrefetcher(degree=4)
         system.l2cache.cpu_side = system.l2bus.mem_side_ports
         system.l2cache.mem_side = system.membus.cpu_side_ports
 
@@ -252,7 +256,9 @@ def build_system(args):
     system.system_port = system.membus.cpu_side_ports
 
     system.mem_ctrl = MemCtrl()
-    system.mem_ctrl.dram = DDR3_1600_8x8()
+    system.mem_ctrl.dram = (
+        DDR4_2400_8x8() if args.dram == "ddr4_2400" else DDR3_1600_8x8()
+    )
     system.mem_ctrl.dram.range = system.mem_ranges[0]
     system.mem_ctrl.port = system.membus.mem_side_ports
 
@@ -306,6 +312,7 @@ def attach_phq(system, args):
         mshr_pressure_threshold=args.mshr_pressure_threshold,
         scoreboard_read_ports=args.phq_scoreboard_read_ports,
         adder_throughput=args.phq_adder_throughput,
+        phq_port_retry_limit=args.phq_port_retry_limit,
         # Derived, never supplied independently: the PHQ's only in-band view
         # of L1D occupancy is a refused sendTimingReq(), so it needs to know
         # how many MSHRs the cache it shares a port with actually has. Two
