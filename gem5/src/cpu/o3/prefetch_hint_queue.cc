@@ -92,6 +92,7 @@ PrefetchHintQueue::PrefetchHintQueue(const Params &params)
       mshrPressureThreshold(params.mshr_pressure_threshold),
       scoreboardReadPorts(params.scoreboard_read_ports),
       adderThroughput(std::max<unsigned>(params.adder_throughput, 8u)),
+      portRetryLimit(params.phq_port_retry_limit),
       l1dMshrs(params.l1d_mshrs),
       tickEvent([this] { tick(); }, name() + ".tick"),
       phqStats(this)
@@ -219,6 +220,7 @@ PrefetchHintQueue::dispatchHint(const DynInstPtr &inst)
     e.fanout = f.fanout;
     e.state = EntryState::WaitOperand;
     e.pollCount = 0;
+    e.portRetries = 0;
     e.issued = 0;
 
     // DESIGN.md 1.4: "Rename source-map read: yes (cheap; acknowledged
@@ -400,7 +402,17 @@ PrefetchHintQueue::issueReadyEntries()
             // is best-effort (DESIGN.md 1.3.4); we never stall the core for
             // it. Non-droppable hints get to try again next cycle; droppable
             // ones die now so they stop occupying an entry.
+            // v8: if the *port* refused (cache blocked) and the entry still
+            // has retry budget, keep it Ready and try the same prefetch next
+            // cycle instead of dropping the rest of the hint.
+            if (lastSendPortBlocked && e.portRetries < portRetryLimit) {
+                ++e.portRetries;
+                ++phqStats.portRetries;
+                break;
+            }
             if (e.droppable) {
+                if (lastSendPortBlocked)
+                    ++phqStats.portDrops;
                 dropEntry(idx, phqStats.hintsDroppedMshr);
             }
             break;
@@ -593,6 +605,8 @@ PrefetchHintQueue::sendRequest(Addr vaddr, unsigned size, bool is_chase_load,
 {
     Entry &e = entries[entry_idx];
 
+    lastSendPortBlocked = false;
+
     if (!is_chase_load) {
         vaddr &= ~(Addr(size - 1));
     } else if ((vaddr & (size - 1)) != 0 ||
@@ -659,6 +673,7 @@ PrefetchHintQueue::sendRequest(Addr vaddr, unsigned size, bool is_chase_load,
         // simply throw the request away. This is also the only in-band
         // signal we get about real MSHR pressure.
         ++phqStats.portBlocked;
+        lastSendPortBlocked = true;
         delete pkt->senderState;
         pkt->senderState = nullptr;
         delete pkt;
@@ -986,6 +1001,10 @@ PrefetchHintQueue::PHQStats::PHQStats(statistics::Group *parent)
                "PHQ addresses with no valid translation"),
       ADD_STAT(portBlocked, statistics::units::Count::get(),
                "Times the shared D-cache port refused a PHQ request"),
+      ADD_STAT(portRetries, statistics::units::Count::get(),
+               "Port refusals answered by holding the entry and retrying"),
+      ADD_STAT(portDrops, statistics::units::Count::get(),
+               "Hints dropped because the D-cache port stayed blocked"),
       ADD_STAT(prefetchesRequestedL2, statistics::units::Count::get(),
                "Prefetches whose LEVEL bit asked for L2 (advisory; see "
                "README)")
