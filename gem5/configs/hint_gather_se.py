@@ -99,6 +99,19 @@ def build_parser():
     p.add_argument("--l1d-mshrs", type=int, default=32)
     p.add_argument("--cacheline-size", type=int, default=64)
     p.add_argument(
+        "--l2-prefetcher",
+        choices=("none", "stride"),
+        default="stride",
+        help="Baseline hardware prefetcher on the L2 (v5: a real degree-4 "
+        "StridePrefetcher is instantiated, matching the paper's methodology).",
+    )
+    p.add_argument(
+        "--dram",
+        choices=("ddr4_2400", "ddr3_1600"),
+        default="ddr4_2400",
+        help="Main-memory DRAM model (v5 default DDR4-2400 8x8).",
+    )
+    p.add_argument(
         "--l1d-prefetcher",
         choices=("none", "stride"),
         default="none",
