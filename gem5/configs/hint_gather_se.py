@@ -1,4 +1,3 @@
-# Copyright 2026 Google LLC
 #
 # HINT.GATHER -- gem5 SE-mode configuration script.
 #
@@ -244,8 +243,8 @@ def build_system(args):
         )
 
         system.l2cache = L2Cache(size=args.l2_size)
-            if args.l2_prefetcher == "stride":
-                system.l2cache.prefetcher = StridePrefetcher(degree=4)
+        if args.l2_prefetcher == "stride":
+            system.l2cache.prefetcher = StridePrefetcher(degree=4)
         system.l2cache.cpu_side = system.l2bus.mem_side_ports
         system.l2cache.mem_side = system.membus.cpu_side_ports
 
