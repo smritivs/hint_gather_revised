@@ -202,12 +202,22 @@ define REQUIRE_PLUGIN
 endef
 
 # --- RISC-V ----------------------------------------------------------------
-# base and swpf use GCC directly (handles xpack multilib correctly).
+# base and swpf: compile with clang, exactly like the hint variant, so that
+# `#pragma clang loop unroll_count(8)` (HG_UNROLL_ALL) applies to every
+# variant; GCC ignores that pragma.  Link with GCC (xpack multilib).
 $(BUILD_DIR)/%.base.elf: $$(SRCS_$$*) $(HDRS) | $(BUILD_DIR)
-	$(CC_RISCV) $(GCC_FLAGS) $(CFLAGS) $(DEFS_base) $(SRCS_$*) -o $@
+	@for src in $(SRCS_$*); do \
+	  echo "$(HG_CLANG) ... -c $$src -o $(BUILD_DIR)/$*.$${src%.c}.base.o"; \
+	  $(HG_CLANG) $(CLANG_RV_FLAGS) $(CFLAGS) $(DEFS_base) -c $$src -o $(BUILD_DIR)/$*.$${src%.c}.base.o || exit 1; \
+	done
+	$(CC_RISCV) $(GCC_FLAGS) $(CFLAGS) $(DEFS_base) $(patsubst %.c,$(BUILD_DIR)/$*.%.base.o,$(SRCS_$*)) -o $@
 
 $(BUILD_DIR)/%.swpf.elf: $$(SRCS_$$*) $(HDRS) | $(BUILD_DIR)
-	$(CC_RISCV) $(GCC_FLAGS) $(CFLAGS) $(DEFS_swpf) $(SRCS_$*) -o $@
+	@for src in $(SRCS_$*); do \
+	  echo "$(HG_CLANG) ... -c $$src -o $(BUILD_DIR)/$*.$${src%.c}.swpf.o"; \
+	  $(HG_CLANG) $(CLANG_RV_FLAGS) $(CFLAGS) $(DEFS_swpf) -c $$src -o $(BUILD_DIR)/$*.$${src%.c}.swpf.o || exit 1; \
+	done
+	$(CC_RISCV) $(GCC_FLAGS) $(CFLAGS) $(DEFS_swpf) $(patsubst %.c,$(BUILD_DIR)/$*.%.swpf.o,$(SRCS_$*)) -o $@
 
 # hint: compile with clang (for the pass plugin) then link with GCC.
 $(BUILD_DIR)/%.hint.elf: $$(SRCS_$$*) $(HDRS) $(HG_PLUGIN) $(HG_GENOME) | $(BUILD_DIR) $(REPORT_DIR)
