@@ -6,7 +6,7 @@
   "hint_distance": 64,
   "max_hints_per_loop": 1,
   "min_trip_count": 64,
-  "mshr_pressure_threshold": 0.90,
+  "mshr_pressure_threshold": 0.75,
   "notes": "revised co-design genome: fanout=8 strip-mined chase, d=64, 32 PHQ entries",
   "origin": "revised",
   "parent_id": "seed",
