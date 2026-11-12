@@ -154,11 +154,35 @@
 #endif
 
 #if HG_BUILD_SWPF
+/* v5: gem5 v24's RISC-V decoder executes Zicbop `prefetch.r` as a plain
+ * `ori x0` NOP, and `-march=rv64gc` (no Zicbop) makes LLVM drop
+ * __builtin_prefetch entirely.  So that the software-prefetch baseline
+ * really prefetches in simulation, each prefetch is emulated by a byte load
+ * to x0 (HG_SWPF_LOAD_EMU=1, the default).  NOTE: unlike a real prefetch this
+ * is a *binding* load: it can fault and the O3 core cannot retire it until the
+ * data returns, so the emulation is pessimistic for the SWPF baseline.  Set
+ * HG_SWPF_LOAD_EMU=0 to fall back to __builtin_prefetch on hardware/models
+ * that implement Zicbop. */
+#ifndef HG_SWPF_LOAD_EMU
+#define HG_SWPF_LOAD_EMU 1
+#endif
+#if HG_SWPF_LOAD_EMU
+#define HG_PREFETCH_R(p) \
+  __asm__ volatile("lbu zero, 0(%0)" ::"r"((const void *)(p)))
+#else
 /* rw=0 (read), locality=3 (keep in all levels), i.e. an ordinary
  * prefetch.r / prefetchnta-class instruction. */
 #define HG_PREFETCH_R(p) __builtin_prefetch((const void *)(p), 0, 3)
+#endif
 #else
 #define HG_PREFETCH_R(p) ((void)(p))
+#endif
+
+/* v5: apply the same x8 loop unroll to every build variant (base, swpf, hint)
+ * so that comparisons isolate the effect of prefetching from the effect of
+ * unrolling.  Set HG_UNROLL_ALL=0 to restore the v4 behaviour (hint-only). */
+#ifndef HG_UNROLL_ALL
+#define HG_UNROLL_ALL 1
 #endif
 
 /* Emit a manual HINT.GATHER.C at a gather site.  A no-op unless this is the
