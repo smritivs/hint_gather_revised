@@ -260,3 +260,22 @@ only.
 
 Storage is flip-flops throughout; no SRAM macro is warranted at any point in
 the parameter range.
+
+---
+
+## 8. Storage of the evaluated configuration
+
+Sections 2-7 size the queue entries alone, for 4 to 16 entries. The
+configuration evaluated in `docs/RESULTS.md` has 32 entries and adds the
+chase-mode structures:
+
+| Structure | Organization | Bits (bytes) |
+|---|---|---:|
+| PHQ entries | 32 × 506 b (the 179 b of sec 2 + 64 b chase address + 8 × 32 b indices + 7 b retry counter) | 16 192 (2 024) |
+| Index-line buffer | 4 × (512 + 58 tag + 1 + 2 LRU) b | 2 292 (286.5) |
+| Recent-prefetch ring | 128 × 58 b block tags | 7 424 (928) |
+| In-flight block CAM | 24 × 58 b (sized to the MSHR gate) | 1 392 (174) |
+| **Total** | about 3.33 KiB, about 10.4% of a 32 KiB L1D | **27 300 (3 412.5)** |
+
+This is an analytical storage count. Logic (the eight address adders and the
+comparators) is not included, and no RTL exists.
