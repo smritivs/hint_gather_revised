@@ -39,8 +39,13 @@ Patcher options: `--check` (exit 0 applied / 1 not applied / 2 partial),
 ```bash
 $GEM5_ROOT/build/RISCV/gem5.opt gem5/configs/hint_gather_se.py \
     --binary bench/build/gather.hint.elf --options "--size 8192 --iters 8" \
-    --cpu-type o3 --phq-entries 32 --prefetch-level L1D
+    --cpu-type o3 --phq-entries 32 --prefetch-level L1D --phq-port-retry-limit 64
 ```
+
+The defaults model a 256 kB L2 with a degree-4 stride prefetcher and DDR4-2400
+(`--l2-size`, `--l2-prefetcher {none,stride}`, `--dram {ddr4_2400,ddr3_1600}`).
+`--phq-port-retry-limit N` lets the PHQ retry a prefetch that a busy L1D
+refuses; the default 0 drops it at once, and the reported results use 64.
 
 Add `--disable-phq` for the baseline. The PHQ stats still appear (as zeros),
 so the stats parser needs no special case.
@@ -65,6 +70,7 @@ don't rename them (see DESIGN.md §4.2 for the full list):
 
 ```
 hintsDispatched  hintsDropped  prefetchesIssued  prefetchesLate  chaseLoadsIssued
+portRetries  portDrops                                  # L1D refusals retried / given up
 iqEntriesAllocated  lsqEntriesAllocated  fuPortCycles   # must be 0
 robEntriesAllocated                                     # must be > 0
 ```
