@@ -20,8 +20,11 @@ threads, or file I/O) so it runs in gem5 SE mode. Spec: [DESIGN.md §4.4](../doc
 | Variant | Description |
 |---|---|
 | `base` | No software prefetching |
-| `swpf` | `__builtin_prefetch` on the same targets — the baseline `HINT.GATHER` must beat |
+| `swpf` | Software prefetching of the same targets, emulated with byte loads to `x0` (gem5 executes `prefetch.r` as a no-op) |
 | `hint` | Same source as `base`; hints inserted by the LLVM pass |
+
+All three variants are compiled with Clang and unrolled ×8 by the same pragma,
+so a comparison measures prefetching and not unrolling.
 
 ## Build
 
@@ -47,9 +50,11 @@ Suggested gem5 sizes (the runs used in `docs/RESULTS.md`):
 
 | Benchmark | Arguments |
 |---|---|
-| `gather` | `--size 8192 --iters 8` (L2-resident), `--size 65536 --iters 4` (spills to DRAM) |
-| `bfs`, `pagerank` | `--size 131072 --iters 2` |
+| `gather` | `--size 8192 --iters 8` (96 KiB, fits in the L2), `--size 65536 --iters 4` (768 KiB), `--size 1048576 --iters 1` (12 MiB) |
+| `bfs` | `--size 8192 --iters 8`, `--size 65536 --iters 2` |
+| `pagerank` | `--size 131072 --iters 2` |
 | `listchase` | `--size 262144 --iters 8` |
 
 Same `--size`/`--iters`/`--seed` gives the same checksum on x86 and RISC-V
 across all three variants, so any `base` vs `hint` difference is a real bug.
+
