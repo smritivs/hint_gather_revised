@@ -347,6 +347,8 @@ def o3_config_args(genome: Genome, elf_path: str, *, cpu_type: str = "o3",
         "--tlb-miss-policy", genome.tlb_miss_policy,
         "--prefetch-level", genome.prefetch_level,
         "--mshr-pressure-threshold", str(genome.mshr_pressure_threshold),
+        # Retry prefetches that a busy L1D refuses (value used for the reported results).
+        "--phq-port-retry-limit", "64",
         "--l1d-prefetcher", l1d_prefetcher,
     ]
     if disable_phq:
