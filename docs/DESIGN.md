@@ -91,7 +91,7 @@ form of the idea; it costs one extra small state machine per PHQ entry.
 
 | Structure | Normal load / `prefetch.r` | `HINT.GATHER` |
 |---|---|---|
-| ROB entry | yes | **yes** (in-order commit, precise exceptions) |
+| ROB entry | yes | **yes** (in-order commit; squashed on mispredicted paths) |
 | Issue queue entry | yes | **no** |
 | Functional-unit / AGU port | yes | **no** (dedicated PHQ adder) |
 | LSQ entry + ordering CAM | yes | **no** |
@@ -109,10 +109,10 @@ prefetch — but we implement and measure it.)
 
 ## 2. The Prefetch Hint Queue (PHQ)
 
-A small structure adjacent to the LSQ.
+A small structure beside the L1D. The evaluated configuration has 32 entries.
 
 ```
-struct PHQEntry {                       // ~82 bits
+struct PHQEntry {                       // bit counts: gem5/docs/AREA.md
     uint64_t base;                      // 64b  rs1 value
     uint64_t index_or_addr;             // (shared storage, see below)
     uint16_t seq_num;                   // 16b  for squash
@@ -127,17 +127,32 @@ struct PHQEntry {                       // ~82 bits
 ```
 
 Behaviour per cycle:
-1. Accept up to `phq_dispatch_width` (default 2) new entries from dispatch.
+1. Accept up to `phq_dispatch_width` (default 4) new entries from dispatch.
 2. Advance waiting entries per `wakeup_policy`; drop on `poll_count >
    phq_poll_limit`.
-3. For `READY` entries, compute `base + (index << shift)` on the dedicated
-   adder and issue `fanout + 1` prefetch requests (successive entries step the
-   index address by `1 << shift`).
-4. If the target cache's MSHRs are full (or above `mshr_pressure_threshold`)
-   and the hint is droppable, **drop it** and increment `phqHintsDropped`.
+3. Chase form: read up to eight consecutive indices from a 4 × 64 B
+   index-line buffer (fully associative, LRU). A 64 B line holds sixteen
+   32-bit indices, so consecutive hints share lines. In the gem5 model a
+   buffer miss is filled by a functional, zero-latency read.
+4. For `READY` entries, compute up to eight target addresses
+   `base + (index << shift)` per cycle and translate them with a
+   non-faulting lookup. If a translation fails, the rest of a droppable hint
+   is dropped.
+5. Skip targets whose 64 B block is in a 128-entry ring of recently
+   prefetched blocks; send the others to the L1D as software-prefetch
+   requests.
+6. If the L1D refuses a request, keep the entry and retry on the next cycle,
+   up to `phq_port_retry_limit` refusals per hint (64 in the reported runs;
+   0 drops at once). Nothing else issues in a refusal cycle.
+7. MSHR-pressure gate: while at least `max(16, floor(32 ×
+   mshr_pressure_threshold))` = 24 PHQ blocks are in flight, droppable
+   prefetches are dropped. The cache acknowledges prefetches at once, so this
+   gate never triggered in our runs.
 
-Area: `phq_entries × ~82 bits` + one 64-bit adder + `phq_entries` comparators
-(only in `tag_snoop` mode). At 8 entries that is 656 bits of state.
+Storage of the evaluated design (analytical estimate, no RTL): 32 entries ×
+506 b, a 4 × 573 b index-line buffer, a 128 × 58 b ring and a 24 × 58 b
+in-flight block CAM, 27,300 b in total, about 3.33 KiB (about 10.4% of a
+32 KiB L1D). Logic is not counted. See `gem5/docs/AREA.md`.
 
 ---
 
@@ -149,19 +164,19 @@ only by updating this section.
 
 ```json
 {
-  "hint_distance":      32,
-  "fanout":             1,
+  "hint_distance":      64,
+  "fanout":             8,
   "entropy_threshold":  0.35,
   "variant":            "chase",
   "prefetch_level":     "L1D",
   "droppable":          true,
-  "phq_entries":        8,
-  "phq_dispatch_width": 2,
-  "phq_poll_limit":     16,
+  "phq_entries":        32,
+  "phq_dispatch_width": 4,
+  "phq_poll_limit":     32,
   "wakeup_policy":      "poll_rf",
   "tlb_miss_policy":    "drop",
   "mshr_pressure_threshold": 0.75,
-  "max_hints_per_loop": 2,
+  "max_hints_per_loop": 1,
   "min_trip_count":     64
 }
 ```
@@ -182,6 +197,9 @@ only by updating this section.
 | `mshr_pressure_threshold` | float, 0.0..1.0 | gem5, ChampSim |
 | `max_hints_per_loop` | int, 1..8 | LLVM |
 | `min_trip_count` | int | LLVM |
+
+The values above are `genomes/default.json`, used for the gathers.
+`genomes/bfs_tuned.json` (hint distance 2, poll limit 64) is used for BFS.
 
 ---
 
@@ -215,6 +233,15 @@ first load's result feeds the GEP index. Reject the site if
 count ≥ `min_trip_count`. Cap at `max_hints_per_loop` per loop, ranked by
 profiled entropy when a profile is available.
 
+**Lookahead clamp**: in chase form a fanout-`f` hint covers
+`B[i+d] … B[i+d+f-1]`. In loops whose trip count changes from one outer-loop
+iteration to the next (for example a CSR edge loop), the pass limits `rs2` to
+`min(&B[i+d], max(start, last + step - f * sizeof(B[0])))`, so the window
+stays inside the loop's index range. The limit is computed once in the loop
+preheader; the min is branch-free (5 RV64GC instructions per hint).
+`-mllvm -hg-clamp-lookahead=false` turns it off. Clamped sites are reported
+as `"lookahead_clamped": true` in `hint_sites.json`.
+
 **`hint_sites.json`** (written in `analyze`/`profile` mode, read by ChampSim node):
 
 ```json
@@ -233,6 +260,7 @@ profiled entropy when a profile is available.
       "estimated_trip_count": 4096,
       "entropy": 0.83,
       "emitted": true,
+      "lookahead_clamped": false,
       "pc_symbol": "__hg_site_0"
     }
   ]
@@ -288,6 +316,8 @@ by the repair agent).
 --wakeup-policy {poll_rf,tag_snoop} --tlb-miss-policy {drop,walk}
 --prefetch-level {L1D,L2C} --mshr-pressure-threshold F
 --l1d-prefetcher {none,stride} --disable-phq
+--l2-size SIZE (default 256kB) --l2-prefetcher {none,stride} (default stride, degree 4)
+--dram {ddr4_2400,ddr3_1600} --phq-port-retry-limit N (default 0; 64 in the reported runs)
 --options "ARGS"
 ```
 
@@ -302,6 +332,8 @@ system.cpu.phq.hintsDroppedSquash
 system.cpu.phq.hintsDroppedFull
 system.cpu.phq.prefetchesIssued
 system.cpu.phq.prefetchesLate
+system.cpu.phq.portRetries          # L1D refusals answered by retrying
+system.cpu.phq.portDrops            # hints dropped because the L1D stayed busy
 system.cpu.phq.occupancyAvg
 system.cpu.phq.iqEntriesAllocated    # MUST be 0 — structural assertion
 system.cpu.phq.lsqEntriesAllocated   # MUST be 0 — structural assertion
@@ -342,9 +374,16 @@ hg_late_prefetches: N
 
 ```
 build/<b>.base.elf     # no software prefetching at all
-build/<b>.swpf.elf     # Zicbop-style software prefetch baseline (ordinary instructions)
+build/<b>.swpf.elf     # software prefetching, emulated with byte loads to x0
 build/<b>.hint.elf     # HINT.GATHER
 ```
+
+All three variants are unrolled ×8 by the same source pragma
+(`HG_UNROLL_ALL`), so a comparison measures prefetching and not unrolling;
+all three must therefore be compiled with Clang. gem5 executes `prefetch.r`
+as a no-op, so each software prefetch is a byte load to `x0`
+(`HG_SWPF_LOAD_EMU`). `HG_SWPF_SEGMENT_BOUND=1` stops BFS software prefetches
+at the current vertex's last edge.
 
 Every benchmark must:
 * accept `--iters N` and `--size N`,
@@ -384,10 +423,14 @@ reward hint spam. The inner fitness is penalised and periodically re-anchored
 against gem5:
 
 ```
-fitness = (ipc_hint / ipc_swpf_baseline) - lambda * hints_per_1k_insts
-                                          - mu  * wasted_prefetch_rate
+fitness = speedup_vs_swpf + 0.05 * miss_coverage - lambda * hints_per_1k_insts
+                                                 - mu     * wasted_prefetch_rate
 ```
 
+`speedup_vs_swpf` is the ChampSim IPC ratio, or the gem5 O3 cycle ratio when no
+ChampSim traces exist (as in our run). `miss_coverage` is the L1D demand-miss
+reduction relative to software prefetching and is added only in the gem5 case.
+`mu` is `0.05`.
 `lambda` starts at `0.01` and is recalibrated every `reanchor_every` generations
 by regressing observed gem5 O3 IPC against ChampSim IPC and hint density for the
 top-N candidates.
@@ -406,3 +449,12 @@ top-N candidates.
 3. RISC-V Zicbop already standardises prefetch hints. Our novelty is the
    **dispatch-path treatment**, not the encoding; `custom-0` is used because
    Zicbop cannot express the distance/fan-out/variant operands.
+4. The software-prefetch baseline is emulated with byte loads, which must
+   complete before they retire. This is pessimistic for software prefetching,
+   so the equally unrolled `base` build is the fairer reference.
+5. PHQ index-line reads take zero time in the gem5 model, and PHQ requests and
+   retries are not arbitrated against the core's load ports. Both favour
+   `HINT.GATHER`.
+6. The `LEVEL` bit is advisory: every prefetch fills the L1D.
+7. In syscall-emulation mode the binary's path length changes cycle counts
+   (stack alignment), so results should be averaged over several layouts.
