@@ -116,7 +116,8 @@ def run_gem5_eval(
             "--phq-entries=32",
             "--phq-dispatch-width=4",
             "--phq-adder-throughput=8",
-            "--mshr-pressure-threshold=0.90",
+            "--mshr-pressure-threshold=0.75",
+            "--phq-port-retry-limit=64",
         ]
         if v != "hint":
             o3_cmd.append("--disable-phq")
@@ -124,16 +125,9 @@ def run_gem5_eval(
         m_o3 = re.search(r"CHECKSUM=(0x[0-9a-fA-F]+)", p_o3.stdout)
         o3_sum = m_o3.group(1) if m_o3 else "NONE"
 
-        # Enable L2 StridePrefetcher(degree=4) on config.ini
-        cfg_ini = od_o3 / "config.ini"
-        if cfg_ini.is_file():
-            txt = cfg_ini.read_text(encoding="utf-8")
-            txt = re.sub(
-                r"(\[system\.l2cache\]\n(?:[^\[]*\n)*?)prefetcher=Null",
-                r"\1prefetcher=system.l2cache.prefetcher\n\n[system.l2cache.prefetcher]\ntype=StridePrefetcher\ndegree=4\n",
-                txt,
-            )
-            cfg_ini.write_text(txt, encoding="utf-8")
+        # The L2 StridePrefetcher(degree=4) is instantiated for real by
+        # gem5/configs/hint_gather_se.py (--l2-prefetcher=stride, the default);
+        # config.ini is no longer edited after the simulation.
 
         st = parse_stats(od_o3 / "stats.txt")
         return v, {
@@ -235,7 +229,7 @@ def format_comparison_table(
         f"  {'phq.hintsDispatched':<37} | {0:>13,d} | {0:>13,d} | {dispatched:>13,d} | 100% ({dispatched}/{rob})",
         f"  {'phq.chaseLoadsIssued (Index Loads)':<37} | {0:>13,d} | {0:>13,d} | {chases:>13,d} | ChaseLine buffered",
         f"  {'phq.prefetchesIssued':<37} | {0:>13,d} | {0:>13,d} | {pf_issued:>13,d} | Active PHQ stream",
-        f"  {'PHQ Structural (iq / lsq / fu)':<37} | {'0 / 0 / 0':>13} | {'(nonzero)':>13} | {f'{iq} / {lsq} / {fu}':>13} | {'PASS (Zero-Issue)' if (iq==0 and lsq==0 and fu==0) else 'FAIL'}",
+        f"  {'PHQ Structural (iq / lsq / fu)':<37} | {'0 / 0 / 0':>13} | {'n/a':>13} | {f'{iq} / {lsq} / {fu}':>13} | {'PASS (Zero-Issue)' if (iq==0 and lsq==0 and fu==0) else 'FAIL'}",
         f"  {'Architectural Checksum Equivalence':<37} | {str(b['o3_sum']):>13} | {str(s['o3_sum']):>13} | {str(h['o3_sum']):>13} | {'EXACT MATCH' if h['o3_sum'] == b['o3_sum'] else 'MISMATCH'}",
         "=" * 104,
     ]
@@ -362,7 +356,7 @@ def main() -> int:
         )
         workloads = [
             ("8K Elements (L2-Resident Working Set)", 8192, 8, res_8k),
-            ("64K Elements (DRAM-Spilling Working Set)", 65536, 4, res_64k),
+            ("64K Elements (768 KiB; spills the 256 KiB L2)", 65536, 4, res_64k),
         ]
 
     print("\n[4/4] Verification & Comparison Report (also saved to report.txt):")
