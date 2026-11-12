@@ -61,6 +61,9 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -103,6 +106,14 @@ static cl::opt<bool> HGEmitSiteLabels(
     "hg-emit-site-labels",
     cl::desc("Emit __hg_site_<id> labels in analyze mode for PC resolution"),
     cl::init(false));
+
+// v7: trip-count-aware lookahead clamping (see emitSite).  On by default; the
+// flag exists so the effect can be ablated.
+static cl::opt<bool> HGClampLookahead(
+    "hg-clamp-lookahead",
+    cl::desc("Clamp the chase-form lookahead pointer so that the fanout window "
+             "never extends past the loop's last index element"),
+    cl::init(true));
 
 namespace {
 
@@ -322,6 +333,14 @@ struct Candidate {
   int64_t IdxStepBytes = 0; // constant step of &B[i] per iteration
 
   bool ScevAffine = false; // dependent-load pointer is an affine AddRec
+  // v7 lookahead clamp: integer SCEV of the highest legal rs2 (address of the
+  // first element of the last fanout-wide window inside the loop's index
+  // range), or null when the trip count is not computable.
+  ScalarEvolution *SE = nullptr;
+  DominatorTree *DT = nullptr;
+  LoopInfo *LI = nullptr;
+  const SCEV *ClampLimit = nullptr;
+  bool Clamped = false;
   int64_t TripCount = -1;  // -1 == not statically known
   double Entropy = -1.0;   // -1 == unknown (no profile available)
   double Score = 0.0;
@@ -454,6 +473,8 @@ private:
   std::vector<Candidate> Sites;
   unsigned NextId = 0;
   bool TargetIsRISCV = false;
+  DominatorTree *CurDT = nullptr; // v7: for dedicated-preheader insertion
+  LoopInfo *CurLI = nullptr;
 };
 
 bool HintGatherImpl::run() {
@@ -479,6 +500,8 @@ bool HintGatherImpl::run() {
       continue;
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
     ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+    CurDT = &FAM.getResult<DominatorTreeAnalysis>(F);
+    CurLI = &LI;
     collect(F, LI, SE);
   }
 
@@ -620,6 +643,55 @@ void HintGatherImpl::examineLoop(Function &F, Loop *L, ScalarEvolution &SE,
               C.skip("addrec_step_too_wide");
             else
               C.IdxStepBytes = V.getSExtValue();
+            // ---- v7: lookahead clamp limit --------------------------------
+            // The chase hint covers `fanout` index elements starting at rs2.
+            // Near the end of the loop, &B[i+d] runs past the loop's index
+            // range (e.g. into the next CSR vertex's edge list), so the PHQ
+            // prefetches targets the program never touches.  If SCEV can
+            // compute the backedge-taken count, the last legal window start is
+            //   last = start + BTC*step;  lim = last + step - fanout*sizeof(B)
+            // and emitSite clamps rs2 = min(&B[i+d], max(lim, start)).
+            const SCEV *BTC = SE.getBackedgeTakenCount(L);
+            if (HGVerbose) {
+              errs() << "[hint-gather] clamp: loop " << nameOf(L->getHeader())
+                     << " step=" << C.IdxStepBytes << " BTC=";
+              BTC->print(errs());
+              errs() << "\n";
+            }
+            Type *IntTy = DL.getIntPtrType(IdxPtr->getType());
+            TypeSize IdxTS = DL.getTypeStoreSize(IdxLoad->getType());
+            // Only segmented loops are clamped: loops whose trip count changes
+            // from one parent-loop iteration to the next (e.g. a CSR edge
+            // loop bounded by offsets[u]..offsets[u+1]).  Their trip counts
+            // are short and data dependent, so the lookahead overshoots into
+            // a neighbouring segment on every parent iteration.  A flat loop
+            // (trip count invariant in its parent, e.g. a gather over n
+            // elements) overshoots only once at its very end, which is not
+            // worth a per-hint min().
+            Loop *Parent = L->getParentLoop();
+            const bool Segmented = Parent && !isa<SCEVCouldNotCompute>(BTC) &&
+                                   !SE.isLoopInvariant(BTC, Parent);
+            if (HGClampLookahead && Segmented && C.IdxStepBytes > 0 &&
+                !IdxTS.isScalable() && !isa<SCEVCouldNotCompute>(BTC) &&
+                BTC->getType()->isIntegerTy() &&
+                BTC->getType()->getIntegerBitWidth() <=
+                    IntTy->getIntegerBitWidth()) {
+              const int64_t ElemB = static_cast<int64_t>(IdxTS.getFixedValue());
+              const SCEV *StartI = SE.getPtrToIntExpr(AR->getStart(), IntTy);
+              if (!isa<SCEVCouldNotCompute>(StartI)) {
+                const SCEV *BTCx = SE.getZeroExtendExpr(BTC, IntTy);
+                const SCEV *LastI = SE.getAddExpr(
+                    StartI, SE.getMulExpr(BTCx, SE.getConstant(IntTy, C.IdxStepBytes)));
+                const SCEV *LimI = SE.getAddExpr(
+                    LastI, SE.getConstant(IntTy, static_cast<uint64_t>(
+                                                     C.IdxStepBytes - G.Fanout * ElemB),
+                                          /*isSigned=*/true));
+                C.ClampLimit = SE.getUMaxExpr(StartI, LimI);
+                C.SE = &SE;
+                C.DT = CurDT;
+                C.LI = CurLI;
+              }
+            }
           } else {
             // A non-constant step would need a full SCEVExpander to
             // materialise &B[i+d].  Skipping keeps this pass total; see
@@ -803,6 +875,58 @@ bool HintGatherImpl::emitSite(Candidate &C) {
     if (auto *LAI = dyn_cast<Instruction>(LA))
       copyDebugLoc(LAI, C.DepLoad);
     Rs2 = LA;
+
+    // v7: clamp the lookahead to the loop's index range (see examineLoop).
+    // Costs a branch-free unsigned min (5 RV64GC instructions) per hint and a
+    // few loop-invariant instructions in the preheader.
+    if (C.ClampLimit && C.SE && C.L) {
+      // The limit is computed in a dedicated preheader so that it costs
+      // nothing when the loop is skipped (e.g. the remainder loop of a
+      // runtime-unrolled loop whose trip count is a multiple of 8).  If the
+      // unique out-of-loop predecessor also branches elsewhere, split that
+      // edge (DT/LI are updated in place; SCEV shares them).
+      BasicBlock *PH = C.L->getLoopPreheader();
+      if (!PH) {
+        BasicBlock *Pred = C.L->getLoopPredecessor();
+        if (Pred && C.DT && C.LI && C.L->getHeader())
+          PH = SplitEdge(Pred, C.L->getHeader(), C.DT, C.LI, nullptr,
+                         "hg.clamp.ph");
+        if (!PH)
+          PH = Pred;
+      }
+      if (HGVerbose && !PH)
+        errs() << "[hint-gather] clamp: no unique loop predecessor\n";
+      if (PH && PH->getTerminator()) {
+        SCEVExpander Exp(*C.SE, DL, "hg.clamp");
+        if (HGVerbose) {
+          errs() << "[hint-gather] clamp limit: ";
+          C.ClampLimit->print(errs());
+          errs() << " safe="
+                 << Exp.isSafeToExpandAt(C.ClampLimit, PH->getTerminator())
+                 << "\n";
+        }
+        if (Exp.isSafeToExpandAt(C.ClampLimit, PH->getTerminator())) {
+          Value *Lim =
+              Exp.expandCodeFor(C.ClampLimit, IdxTy, PH->getTerminator());
+          if (Lim && Lim->getType() == IdxTy) {
+            // Branch-free unsigned min (RV64GC has no minu without Zbb, and
+            // a select lowers to a branch that mispredicts at the end of
+            // every segment):  m = -(la > lim);  rs2 = la ^ ((la ^ lim) & m)
+            Value *LAInt = B.CreatePtrToInt(LA, IdxTy, "hg.la.int");
+            Value *Gt = B.CreateICmpUGT(LAInt, Lim, "hg.la.past");
+            Value *M = B.CreateNeg(B.CreateZExt(Gt, IdxTy), "hg.la.mask");
+            Value *X = B.CreateXor(LAInt, Lim, "hg.la.x");
+            Value *A = B.CreateAnd(X, M, "hg.la.a");
+            Value *Sel = B.CreateXor(LAInt, A, "hg.la.clamped");
+            for (Value *V : {LAInt, Gt, M, X, A, Sel})
+              if (auto *VI = dyn_cast<Instruction>(V))
+                copyDebugLoc(VI, C.DepLoad);
+            Rs2 = Sel;
+            C.Clamped = true;
+          }
+        }
+      }
+    }
   } else {
     // Value form: rs2 = the index value itself.
     //
@@ -893,6 +1017,7 @@ void HintGatherImpl::writeReport() {
           J.attribute("estimated_trip_count", C.TripCount);
           J.attribute("entropy", C.Entropy);
           J.attribute("emitted", C.Emitted);
+          J.attribute("lookahead_clamped", C.Clamped);
           J.attribute("pc_symbol", C.pcSymbol());
           // Additive field required by the repair loop: the empty string means
           // the site passed every filter.  See README.md.
@@ -982,3 +1107,4 @@ llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "HintGather", LLVM_VERSION_STRING,
           registerCallbacks};
 }
+
