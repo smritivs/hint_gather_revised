@@ -50,7 +50,7 @@ static uint64_t gather_kernel(const uint64_t *a, const uint32_t *b, uint32_t n,
   uint64_t plain = 0;
   uint32_t i;
 
-#if HG_BUILD_HINT && defined(__clang__)
+#if (HG_BUILD_HINT || HG_UNROLL_ALL) && defined(__clang__)
   #pragma clang loop unroll_count(8)
 #endif
   for (i = 0; i < n; ++i) {
@@ -61,6 +61,8 @@ static uint64_t gather_kernel(const uint64_t *a, const uint32_t *b, uint32_t n,
      * cost HINT.GATHER claims to avoid (docs/DESIGN.md sec 1.4). */
     if (i + HG_SWPF_DISTANCE < n) {
       HG_PREFETCH_R(&a[b[i + HG_SWPF_DISTANCE]]);
+    }
+    if (i + 2 * HG_SWPF_DISTANCE < n) { /* v6: own guard -- stay in bounds */
       HG_PREFETCH_R(&b[i + 2 * HG_SWPF_DISTANCE]);
     }
 #endif
@@ -167,3 +169,4 @@ int main(int argc, char **argv) {
   hg_finish(checksum);
   return 0;
 }
+
