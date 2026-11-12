@@ -1,18 +1,20 @@
 # HINT.GATHER: Zero-Issue Prefetching for Irregular Workloads
 
-**Hardware-software co-design of a custom RISC-V indirect prefetch instruction, an LLVM 17 compiler pass, and a zero-issue Out-of-Order Prefetch Hint Queue (`PHQ`), tuned via the CHIA evolutionary framework.**
+**Hardware-software co-design of a custom RISC-V indirect prefetch instruction, an LLVM 17 compiler pass, and a zero-issue Out-of-Order Prefetch Hint Queue (`PHQ`), with a tuning loop built on the CHIA framework.**
 
 ---
 
 ## Overview: Why `HINT.GATHER`?
 
-Hardware stride and stream prefetchers are effective on regular strides (`B[i]`), but fail on data-dependent indirect memory accesses (`A[B[i]]`) that dominate graph traversal (`BFS`, `PageRank`), sparse linear algebra, and pointer-chasing workloads. Compiler-inserted software prefetching (`__builtin_prefetch(&A[B[i+d]])`) fixes cache miss coverage, but on an Out-of-Order (OoO) processor a software prefetch is still a **first-class load instruction**: it consumes a Decode/Rename slot, an Issue Queue (`IQ`) entry, a Functional Unit (`FU`) address-generation port, and a Load-Store Queue (`LSQ`) ordering CAM slot. On pointer-chasing loops, auxiliary address-calculation and prefetch instructions inflate dynamic instruction count by >10% and trade memory-latency stalls for structural pipeline stalls.
+Hardware stride and stream prefetchers are effective on regular strides (`B[i]`), but fail on data-dependent indirect memory accesses (`A[B[i]]`) that dominate graph traversal (`BFS`, `PageRank`), sparse linear algebra, and pointer-chasing workloads. Compiler-inserted software prefetching (`__builtin_prefetch(&A[B[i+d]])`) fixes cache miss coverage, but on an Out-of-Order (OoO) processor a software prefetch is still a **first-class load instruction**: it consumes a Decode/Rename slot, an Issue Queue (`IQ`) entry, a Functional Unit (`FU`) address-generation port, and a Load-Store Queue (`LSQ`) ordering CAM slot. In our `gem5` runs, software prefetching executes 32-91% more instructions than the baseline and is slower than it on the gathers (software prefetches are emulated with byte loads; see [`docs/RESULTS.md`](docs/RESULTS.md)).
 
 **`HINT.GATHER`** solves this by co-designing the compiler pass, the ISA encoding, and the OoO dispatch path together:
-1. **RISC-V `custom-0` Instruction (`opcode 0x0B`)**: A single 32-bit R-type hint (`rd=x0`) supporting both Value mode (`HINT.GATHER`) and Chase mode (`HINT.GATHER.C`, where `rs2` passes the affine lookahead address `&B[i+d]` that is 100% ready at Rename/Dispatch).
-2. **Zero-Issue Dispatch Bypass & Prefetch Hint Queue (`PHQ`)**: At Rename/Dispatch in `gem5`'s `RiscvO3CPU`, `HINT.GATHER` allocates a Reorder Buffer (`ROB`) entry to preserve precise exceptions and in-order commit, hands its descriptor directly to a **0.57 KiB PHQ sidecar** beside L1D, and immediately marks its ROB slot executed—consuming **zero Issue Queue entries (`iq=0`), zero Load-Store Queue entries (`lsq=0`), and zero Functional Unit cycles (`fu=0`)**.
-3. **8-Wide Strip-Mined `ChaseLine` Coalescing**: An out-of-tree LLVM 17 pass (`libHintGather.so`) uses `ScalarEvolution` (`SCEV`) to filter out regular affine strides and strip-mines indirect gathers by `fanout=8`. Inside the PHQ, a 64-byte `ChaseLine` buffer reads a single L1D index line and autonomously drains 8 target prefetches at 8 addresses/cycle (`16×` fewer index reads than scalar software prefetching).
-4. **6-Node CHIA Evolutionary Loop**: Searches the 13-parameter compiler/microarchitecture `Genome` under a strict two-stage correctness gate (architectural `CHECKSUM` equivalence + `iq == lsq == fu == 0` structural assertions), achieving **1.124×–1.153× speedup** on indirect gathers (`-56.58%` L1D demand misses, `-86.06%` L1D MSHR misses) and **1.107× speedup** on `GAP-BFS`.
+1. **RISC-V `custom-0` Instruction (`opcode 0x0B`)**: A single 32-bit R-type hint (`rd=x0`) supporting both Value mode (`HINT.GATHER`) and Chase mode (`HINT.GATHER.C`, where `rs2` passes the lookahead address `&B[i+d]`, computed from the loop counter).
+2. **Zero-Issue Dispatch Bypass & Prefetch Hint Queue (`PHQ`)**: At dispatch in `gem5`'s `RiscvO3CPU`, `HINT.GATHER` takes a Reorder Buffer (`ROB`) entry, so it is squashed on mispredicted paths and commits in order, and is marked executed at once. Its operands go to a 32-entry PHQ beside the L1D (about 3.33 KiB of storage, an analytical estimate). It uses **zero Issue Queue entries (`iq=0`), zero Load-Store Queue entries (`lsq=0`), and zero Functional Unit cycles (`fu=0`)**, which is checked in every run.
+3. **LLVM Pass & Index-Line Buffer**: An out-of-tree LLVM 17 pass (`libHintGather.so`) uses `ScalarEvolution` (`SCEV`) to keep only non-affine gather sites and emits one `fanout=8` hint per loop body (the benchmark loops are unrolled x8 by a source pragma in every build variant). In CSR edge loops it clamps the lookahead to the current vertex's edges. Inside the PHQ, a 4-line buffer holds 64-byte index lines (16 indices each; a zero-latency read in the model): 8,201 hints needed 4,104 line reads on the 8K gather. The PHQ sends up to 8 prefetches per cycle and retries the ones a busy L1D refuses.
+4. **CHIA Co-Design Loop**: `hint_gather_loop.py` (nodes N0-N6) builds, gates and scores candidates over a 14-knob compiler/microarchitecture `Genome`. The two-stage correctness gate requires output identical to `gem5`'s atomic CPU and `iq == lsq == fu == 0`. Our run was small (population 3, two generations) and did not beat the hand-written default, so the reported parameters come from declared sweeps.
+
+**Results (`gem5`, means over five binary layouts):** `HINT.GATHER` is **2.23x** faster than an equally unrolled baseline on a 768 KiB gather, about 1.12x faster on a 12 MiB gather, and 1.06x / 1.24x faster on BFS with 8,192 / 65,536 vertices. It gives no gain (0.998x) when the data fits in the L2. Details, ablations and limitations are in [`docs/RESULTS.md`](docs/RESULTS.md).
 
 ---
 
@@ -24,9 +26,9 @@ hint_gather_revised/
 ├── Makefile                # Wrapper targets (make all, make setup, make verify, etc.)
 ├── Dockerfile              # Linux container environment for macOS / Docker users
 ├── env.yml                 # Conda environment specification (Python 3.10, GCC 12, SCons)
-├── hint_gather_loop.py     # 6-node CHIA co-design orchestrator
+├── hint_gather_loop.py     # CHIA co-design loop (nodes N0-N6)
 ├── config.py               # Automatic toolchain & path discovery
-├── genome.py               # 13-parameter compiler + PHQ hardware Genome
+├── genome.py               # 14-knob compiler + PHQ hardware Genome
 ├── runner.py               # Subprocess runner & SQLite telemetry store
 ├── llvm/                   # Out-of-tree LLVM 17 pass plugin (HintGatherPass.cpp)
 ├── gem5/                   # Idempotent gem5 v24.0 O3 PHQ patcher (apply_phq.py) & C++ sources
@@ -157,7 +159,7 @@ This automatically runs all 6 stages (`setup` $\rightarrow$ `llvm` $\rightarrow$
 | `./run_all.sh gem5` | `make gem5` | Apply the PHQ patch (`gem5/apply_phq.py`) and build `build/RISCV/gem5.opt` |
 | `./run_all.sh champsim` | `make champsim` | Render the genome and run the standalone C++17 sidecar test (`champsim/test_sidecar.cc`) |
 | `./run_all.sh verify` | `make verify` | Run the two-stage correctness gate + `gem5` O3 evaluation and write `report.txt` |
-| `./run_all.sh evolve` | `make evolve` | Launch the 6-node CHIA evolutionary co-design loop (`hint_gather_loop.py --stage full`) |
+| `./run_all.sh evolve` | `make evolve` | Launch the CHIA co-design loop, nodes N0-N6 (`hint_gather_loop.py --stage full`) |
 
 ### Custom Benchmark Sizes & Iterations
 ```bash
@@ -169,31 +171,20 @@ This automatically runs all 6 stages (`setup` $\rightarrow$ `llvm` $\rightarrow$
 
 ## Expected Output (`report.txt`)
 
-Running `./run_all.sh` or `./run_all.sh verify` prints and saves the cycle-accurate `gem5` (`RiscvO3CPU` + `L2 StridePrefetcher(degree=4)`) comparison across `base` (no software prefetch), `swpf` (`__builtin_prefetch`), and `hint gather`:
+Running `./run_all.sh` or `./run_all.sh verify` prints and saves a side-by-side `gem5` comparison (`RiscvO3CPU` + `L2 StridePrefetcher(degree=4)`) of `base` (no software prefetch), `swpf` (software prefetching, emulated with byte loads) and `hint gather` for the 8K and 64K gathers. For each variant it lists dynamic instructions, cycles, L1D demand misses and demand MSHR misses, the PHQ counters, the `iq / lsq / fu` check and the output checksum.
 
-```text
-========================================================================================================
-  8K Elements (L2-Resident Working Set)
-  Workload : gather  |  --size 8192 (96 KiB)  |  --iters 8  |  Genome: variant=chase, fanout=8, distance=64
-========================================================================================================
-  Hardware Metric (gem5 O3 stats.txt)   |  base (No PF) |  swpf (SW PF) |   hint gather | Improvement       
----------------------------------------+---------------+---------------+---------------+-------------------
-  simInsts (Dynamic Instructions)       |     1,208,611 |     1,331,504 |     1,044,801 | -13.55% insts
-  system.cpu.numCycles (Total Cycles)   |       500,241 |       500,669 |       445,339 | -54,902 cyc (+10.98%)
-  Cycle Savings vs swpf (SW Prefetch)   |            -- |       500,669 |       445,339 | -55,330 cyc (+11.05%)
-  dcache.demandMisses::total            |        63,557 |        63,630 |        27,597 | -35,960 misses
-  dcache.demandMshrMisses::total        |        44,280 |        44,260 |         6,173 | -86.06% (-38,107)
-  phq.hintsDispatched                   |             0 |             0 |         8,201 | 100% (8201/8201)
-  phq.chaseLoadsIssued (Index Loads)    |             0 |             0 |         4,104 | ChaseLine buffered
-  phq.prefetchesIssued                  |             0 |             0 |        65,440 | Active PHQ stream
-  PHQ Structural (iq / lsq / fu)        |     0 / 0 / 0 |     (nonzero) |     0 / 0 / 0 | PASS (Zero-Issue)
-  Architectural Checksum Equivalence    | 0xa279a8f479dab697 | 0xa279a8f479dab697 | 0xa279a8f479dab697 | EXACT MATCH
-========================================================================================================
-```
+The paper's numbers for these two workloads (means over five binary layouts, fastest software-prefetch distance):
+
+| Workload | Base cycles | SWPF cycles | HINT cycles | HINT vs. Base | Demand MSHR misses |
+|---|---:|---:|---:|---:|---:|
+| Gather 8K (96 KiB) | 399,211 | 498,170 | 400,071 | 0.998x | -86.1% |
+| Gather 64K (768 KiB) | 5,872,791 | 7,424,008 | 2,633,746 | 2.230x | -77.0% |
+
+A single `verify` run uses one binary layout and one software-prefetch distance, so its numbers are close to these but not equal to them.
 
 ---
 
 ## Documentation
 
 - **[`docs/DESIGN.md`](docs/DESIGN.md)**: Normative ISA encoding (`0x0B`), PHQ microarchitectural specification, LLVM pass contract, and CHIA fitness formulation.
-- **[`docs/RESULTS.md`](docs/RESULTS.md)**: Full `gem5` O3 experimental tables across `gather` (`8K`, `64K`) and `GAP-BFS`, plus evolutionary search progression.
+- **[`docs/RESULTS.md`](docs/RESULTS.md)**: `gem5` O3 results for the three gather sizes and two BFS graphs, with ablations, parameter sweeps and limitations.
