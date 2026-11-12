@@ -42,6 +42,7 @@ clang --target=riscv64-unknown-elf -O2 \
 | `-hg-report` | `hint_sites.json` | Per-site report, written in every mode |
 | `-hg-profile` | — | `hg_profile.json` from a `profile` run; enables entropy ranking |
 | `-hg-verbose` | off | Print candidate counts to stderr |
+| `-hg-clamp-lookahead` | on | In loops whose trip count changes per outer iteration (CSR edge loops), keep the chase-form lookahead window inside the loop's index range |
 
 Every rejected site gets a `skip_reason` in `hint_sites.json`, which is the
 first place to look when the pass emits fewer hints than expected.
