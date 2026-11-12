@@ -40,6 +40,10 @@
 
 #define BFS_UNVISITED 0xFFFFFFFFu
 
+#ifndef HG_SWPF_SEGMENT_BOUND
+#define HG_SWPF_SEGMENT_BOUND 0
+#endif
+
 /* dist[] is uint32_t, so the index scale is 1 << 2 (docs/DESIGN.md sec 1.1). */
 #define BFS_ELEM_SHIFT 2
 
@@ -61,16 +65,26 @@ static uint32_t bfs_level(const hg_csr *graph, uint32_t *dist,
     const uint32_t end = offsets[u + 1u];
     uint32_t e;
 
-#if HG_BUILD_HINT && defined(__clang__)
+#if (HG_BUILD_HINT || HG_UNROLL_ALL) && defined(__clang__)
 #pragma clang loop unroll_count(8)
 #endif
     for (e = begin; e < end; ++e) {
 #if HG_BUILD_SWPF
       /* Honest baseline: the index must be *loaded* before its target can be
        * prefetched, and that load is an ordinary instruction consuming an
-       * issue-queue slot and an LSQ entry (docs/DESIGN.md sec 1.4). */
+       * issue-queue slot and an LSQ entry (docs/DESIGN.md sec 1.4).
+       * v7: HG_SWPF_SEGMENT_BOUND=1 bounds the target prefetch by this
+       * vertex's edge range (end) instead of the whole edge array -- the
+       * software analogue of the v7 pass's lookahead clamp, so both
+       * prefetchers can avoid prefetching a neighbouring vertex's edges. */
+#if HG_SWPF_SEGMENT_BOUND
+      if (e + HG_SWPF_DISTANCE < end) {
+#else
       if (e + HG_SWPF_DISTANCE < num_edges) {
+#endif
         HG_PREFETCH_R(&dist[edges[e + HG_SWPF_DISTANCE]]);
+      }
+      if (e + 2 * HG_SWPF_DISTANCE < num_edges) { /* v6: own guard */
         HG_PREFETCH_R(&edges[e + 2 * HG_SWPF_DISTANCE]);
       }
 #endif
@@ -188,3 +202,4 @@ int main(int argc, char **argv) {
   hg_finish(checksum);
   return 0;
 }
+
